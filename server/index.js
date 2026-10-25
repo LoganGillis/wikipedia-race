@@ -121,19 +121,33 @@ async function fetchRandomArticles(count) {
   url.searchParams.set('rnlimit', String(count));
   url.searchParams.set('origin', '*');
 
-  const res = await fetch(url, {
-    headers: {
-      'User-Agent':
-        'WikipediaRace/1.1 (educational game; contact: github.com/LoganGillis/wikipedia-race)',
-    },
-  });
-  if (!res.ok) throw new Error(`Wikipedia API HTTP ${res.status}`);
-  const data = await res.json();
-  const pages = data?.query?.random;
-  if (!Array.isArray(pages) || pages.length < count) {
-    throw new Error('Wikipedia API returned too few random pages');
+  let lastErr;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const res = await fetch(url, {
+        headers: {
+          'User-Agent':
+            'WikipediaRace/1.2 (educational game; contact: github.com/LoganGillis/wikipedia-race)',
+        },
+      });
+      if (res.status === 429 || res.status >= 500) {
+        lastErr = new Error(`Wikipedia API HTTP ${res.status}`);
+        await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+        continue;
+      }
+      if (!res.ok) throw new Error(`Wikipedia API HTTP ${res.status}`);
+      const data = await res.json();
+      const pages = data?.query?.random;
+      if (!Array.isArray(pages) || pages.length < count) {
+        throw new Error('Wikipedia API returned too few random pages');
+      }
+      return pages.map((p) => ({ title: p.title, url: wikiUrl(p.title) }));
+    } catch (err) {
+      lastErr = err;
+      if (attempt < 4) await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+    }
   }
-  return pages.map((p) => ({ title: p.title, url: wikiUrl(p.title) }));
+  throw lastErr || new Error('Wikipedia API failed');
 }
 
 async function pickStartAndTarget() {
@@ -142,6 +156,49 @@ async function pickStartAndTarget() {
     if (a.title !== b.title) return { startPage: a, targetPage: b };
   }
   throw new Error('Could not pick distinct start/target pages');
+}
+
+/** Resolve redirects to the canonical article (Gray wolf → Wolf). */
+async function resolveWikiPage(page) {
+  if (!page) return null;
+  let title = page.title ? String(page.title).trim() : '';
+  if (!title && page.url) {
+    const path = normalizeWikiPath(page.url);
+    if (path) title = path.slice('/wiki/'.length).replace(/_/g, ' ');
+  }
+  if (!title) return null;
+  const url = new URL(WIKI_API);
+  url.searchParams.set('action', 'query');
+  url.searchParams.set('format', 'json');
+  url.searchParams.set('redirects', '1');
+  url.searchParams.set('titles', title);
+  url.searchParams.set('origin', '*');
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const res = await fetch(url, {
+        headers: {
+          'User-Agent':
+            'WikipediaRace/1.2 (educational game; contact: github.com/LoganGillis/wikipedia-race)',
+        },
+      });
+      if (res.status === 429 || res.status >= 500) {
+        await new Promise((r) => setTimeout(r, 350 * (attempt + 1)));
+        continue;
+      }
+      if (!res.ok) return pageFromTitleOrUrl(title, page.url);
+      const data = await res.json();
+      const pages = data?.query?.pages;
+      if (!pages || typeof pages !== 'object') return pageFromTitleOrUrl(title, page.url);
+      const first = Object.values(pages)[0];
+      if (!first || first.missing != null || !first.title) {
+        return pageFromTitleOrUrl(title, page.url);
+      }
+      return { title: first.title, url: wikiUrl(first.title) };
+    } catch {
+      await new Promise((r) => setTimeout(r, 350 * (attempt + 1)));
+    }
+  }
+  return pageFromTitleOrUrl(title, page.url);
 }
 
 function sanitizeName(name) {
@@ -377,7 +434,7 @@ function setMode(ws, mode) {
   broadcastLobby(lobby, 'lobby_update');
 }
 
-function setPickPage(ws, msg) {
+async function setPickPage(ws, msg) {
   const playerId = socketPlayers.get(ws);
   if (!playerId) return;
   const lobby = findLobbyByPlayer(playerId);
@@ -392,11 +449,12 @@ function setPickPage(ws, msg) {
     send(ws, 'error', { message: `Not your turn to pick the ${role} page` });
     return;
   }
-  const page = pageFromTitleOrUrl(msg.title, msg.url);
+  let page = pageFromTitleOrUrl(msg.title, msg.url);
   if (!page) {
     send(ws, 'error', { message: 'Invalid Wikipedia article' });
     return;
   }
+  page = (await resolveWikiPage(page)) || page;
   if (role === 'start') {
     lobby.startPage = page;
     if (lobby.targetPage && normalizeTitle(lobby.targetPage.title) === normalizeTitle(page.title)) {
@@ -444,12 +502,12 @@ async function startRace(ws) {
         send(ws, 'error', { message: 'Pick mode needs both start and target pages' });
         return;
       }
-      if (normalizeTitle(lobby.startPage.title) === normalizeTitle(lobby.targetPage.title)) {
+      startPage = (await resolveWikiPage(lobby.startPage)) || lobby.startPage;
+      targetPage = (await resolveWikiPage(lobby.targetPage)) || lobby.targetPage;
+      if (normalizeTitle(startPage.title) === normalizeTitle(targetPage.title)) {
         send(ws, 'error', { message: 'Start and target must be different' });
         return;
       }
-      startPage = lobby.startPage;
-      targetPage = lobby.targetPage;
     } else {
       ({ startPage, targetPage } = await pickStartAndTarget());
     }
@@ -493,26 +551,56 @@ function updateProgress(ws, payload) {
   }
 
   const targetTitle = lobby.targetPage?.title;
-  const targetPath = lobby.targetPage?.url
-    ? normalizeWikiPath(lobby.targetPage.url)
-    : null;
-  const currentPath = player.currentUrl
-    ? normalizeWikiPath(player.currentUrl)
-    : player.currentTitle
+  const targetPath =
+    normalizeWikiPath(lobby.targetPage?.url) ||
+    (targetTitle
+      ? normalizeWikiPath('/wiki/' + String(targetTitle).replace(/ /g, '_'))
+      : null);
+  const currentPath =
+    normalizeWikiPath(player.currentUrl) ||
+    (player.currentTitle
       ? normalizeWikiPath('/wiki/' + String(player.currentTitle).replace(/ /g, '_'))
-      : null;
+      : null);
+  // Prefer canonical path match (survives Gray wolf → Wolf once target is resolved).
+  const pathHit = Boolean(targetPath && currentPath && targetPath === currentPath);
   const titleHit =
-    targetTitle &&
-    player.currentTitle &&
+    Boolean(targetTitle) &&
+    Boolean(player.currentTitle) &&
     normalizeTitle(player.currentTitle) === normalizeTitle(targetTitle);
-  const pathHit = targetPath && currentPath && targetPath === currentPath;
-  if ((titleHit || pathHit) && !player.finished) {
+  if ((pathHit || titleHit) && !player.finished) {
     player.finished = true;
     player.finishedAt = Date.now();
     // First to target wins — end the race for everyone immediately
     lobby.status = 'finished';
   }
 
+  broadcastLobby(lobby, 'lobby_update');
+
+  // If not finished yet, resolve redirects async (Gray wolf → Wolf) and re-check.
+  if (!player.finished && lobby.status === 'racing' && (player.currentUrl || player.currentTitle)) {
+    maybeFinishViaCanonical(lobby, player).catch((err) => {
+      console.error('canonical finish check failed:', err);
+    });
+  }
+}
+
+async function maybeFinishViaCanonical(lobby, player) {
+  if (!lobby || lobby.status !== 'racing' || !player || player.finished) return;
+  if (!lobby.targetPage) return;
+  const [cur, tgt] = await Promise.all([
+    resolveWikiPage({ title: player.currentTitle, url: player.currentUrl }),
+    resolveWikiPage(lobby.targetPage),
+  ]);
+  if (!cur || !tgt) return;
+  if (lobby.status !== 'racing' || player.finished) return;
+  if (normalizeTitle(cur.title) !== normalizeTitle(tgt.title)) return;
+  // Upgrade stored target to canonical so everyone sees the real article
+  lobby.targetPage = tgt;
+  player.currentTitle = cur.title;
+  player.currentUrl = cur.url;
+  player.finished = true;
+  player.finishedAt = Date.now();
+  lobby.status = 'finished';
   broadcastLobby(lobby, 'lobby_update');
 }
 
@@ -622,6 +710,83 @@ function handleLinkUnclaim(ws, msg) {
   broadcastRaw(lobby, 'link_unclaimed', { claims: toRemove }, null);
 }
 
+function resetPlayersForNewRound(lobby) {
+  for (const p of lobby.players.values()) {
+    p.clicks = 0;
+    p.currentTitle = null;
+    p.currentUrl = null;
+    p.finished = false;
+    p.finishedAt = null;
+  }
+  lobby.claims = [];
+  lobby.startedAt = null;
+}
+
+/**
+ * Host-only: after a finished race, start another round in the same lobby.
+ * Classic → immediately roll new pages and race.
+ * Pick → back to waiting so pickers choose again, then host Start race.
+ */
+async function nextRound(ws) {
+  const playerId = socketPlayers.get(ws);
+  if (!playerId) {
+    send(ws, 'error', { message: 'Not in a lobby' });
+    return;
+  }
+  const lobby = findLobbyByPlayer(playerId);
+  if (!lobby) {
+    send(ws, 'error', { message: 'Lobby not found' });
+    return;
+  }
+  const player = lobby.players.get(playerId);
+  if (!player?.isHost) {
+    send(ws, 'error', { message: 'Only the host can start the next round' });
+    return;
+  }
+  if (lobby.status !== 'finished') {
+    send(ws, 'error', { message: 'Next round is only available after a finished race' });
+    return;
+  }
+
+  resetPlayersForNewRound(lobby);
+
+  if (lobby.mode === 'pick') {
+    lobby.status = 'waiting';
+    lobby.startPage = null;
+    lobby.targetPage = null;
+    lobby.pickPhase = 'start';
+    assignPickers(lobby);
+    broadcastLobby(lobby, 'lobby_update');
+    return;
+  }
+
+  // Classic: new random pages, go straight into racing
+  send(ws, 'race_preparing', {});
+  try {
+    const { startPage, targetPage } = await pickStartAndTarget();
+    lobby.startPage = startPage;
+    lobby.targetPage = targetPage;
+    lobby.startedAt = Date.now();
+    lobby.status = 'racing';
+    lobby.pickPhase = null;
+    for (const p of lobby.players.values()) {
+      p.clicks = 0;
+      p.currentTitle = startPage.title;
+      p.currentUrl = startPage.url;
+      p.finished = false;
+      p.finishedAt = null;
+    }
+    broadcastLobby(lobby, 'race_started');
+  } catch (err) {
+    console.error('Failed to start next round:', err);
+    lobby.status = 'waiting';
+    lobby.startPage = null;
+    lobby.targetPage = null;
+    broadcastLobby(lobby, 'lobby_update');
+    send(ws, 'error', { message: err.message || 'Failed to start next round' });
+  }
+}
+
 function leaveLobby(ws) {
   const playerId = socketPlayers.get(ws);
   if (!playerId) return;
@@ -636,7 +801,10 @@ function leaveLobby(ws) {
     return;
   }
   if (leaving?.isHost) {
-    const next = lobby.players.values().next().value;
+    for (const p of lobby.players.values()) p.isHost = false;
+    const next =
+      [...lobby.players.values()].find((p) => p.connected) ||
+      lobby.players.values().next().value;
     if (next) next.isHost = true;
   }
   if (lobby.mode === 'pick' && lobby.status === 'waiting') assignPickers(lobby);
@@ -691,10 +859,13 @@ wss.on('connection', (ws) => {
           setMode(ws, msg.mode);
           break;
         case 'set_pick_page':
-          setPickPage(ws, msg);
+          await setPickPage(ws, msg);
           break;
         case 'start_race':
           await startRace(ws);
+          break;
+        case 'next_round':
+          await nextRound(ws);
           break;
         case 'update_progress':
           updateProgress(ws, msg);

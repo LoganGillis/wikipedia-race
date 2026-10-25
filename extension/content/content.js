@@ -465,6 +465,7 @@ function syncRaceContext() {
 }
 
 function applyState(state) {
+  const prevStatus = raceCtx.lobby?.status || null;
   const lobby = state.lobby || null;
   raceCtx.playerId = state.playerId || null;
   raceCtx.playerName = state.playerName || '';
@@ -483,6 +484,20 @@ function applyState(state) {
   }
   if (!raceCtx.racing && lobby?.status !== 'finished') {
     clearCursors();
+  }
+  // Next round / rematch: clear victory overlay when leaving finished
+  if (
+    prevStatus === 'finished' &&
+    lobby &&
+    (lobby.status === 'racing' || lobby.status === 'waiting')
+  ) {
+    const existing = document.getElementById('wr-victory');
+    if (existing) existing.remove();
+    victoryShownFor = null;
+    if (hudTimer) {
+      clearInterval(hudTimer);
+      hudTimer = null;
+    }
   }
   refreshClaimsUi();
   renderHud();
@@ -819,6 +834,13 @@ chrome.runtime.onMessage.addListener((msg) => {
       sessionStorage.setItem('__wr_racing', '1');
     } catch (_) {}
     resetNavForNewRace();
+    const existing = document.getElementById('wr-victory');
+    if (existing) existing.remove();
+    victoryShownFor = null;
+    if (hudTimer) {
+      clearInterval(hudTimer);
+      hudTimer = null;
+    }
     refreshClaimsUi();
     clearCursors();
   }
@@ -941,7 +963,15 @@ function renderHud() {
   } else if (lobby.status === 'racing') statusLine = 'Racing';
   else if (lobby.status === 'finished') statusLine = 'Finished';
 
-  const clicks = me?.clicks ?? 0;
+  // Prefer local nav-stack clicks so the HUD row never lags the roster
+  let clicks = me?.clicks ?? 0;
+  try {
+    const stack = loadStack();
+    const idx = loadIndex();
+    if (idx >= 0 && stack[idx] && typeof stack[idx].clicks === 'number') {
+      clicks = Math.max(clicks, stack[idx].clicks);
+    }
+  } catch (_) {}
   let sw = '00:00.0';
   if (lobby.startedAt && (lobby.status === 'racing' || lobby.status === 'finished')) {
     const end = me?.finished && me.finishedAt ? me.finishedAt : Date.now();
@@ -1048,7 +1078,27 @@ function maybeAnnounceTargetReached() {
   const path = currentArticlePath();
   const targetPath = canonicalWikiPath(lobby.targetPage.url) ||
     canonicalWikiPath('/wiki/' + String(lobby.targetPage.title || '').replace(/ /g, '_'));
-  if (!path || !targetPath || !pathsEqual(path, targetPath)) return;
+  let hit = path && targetPath && pathsEqual(path, targetPath);
+  if (!hit) {
+    // Also accept the page's canonical link (post-redirect URL)
+    try {
+      const canon = document.querySelector('link[rel="canonical"]')?.href;
+      const canonPath = canon ? canonicalWikiPath(canon) : null;
+      if (canonPath && targetPath && pathsEqual(canonPath, targetPath)) hit = true;
+    } catch (_) {}
+  }
+  if (!hit) {
+    const pageTitle = articleTitleFromLocation();
+    if (
+      pageTitle &&
+      lobby.targetPage.title &&
+      pageTitle.replace(/_/g, ' ').trim().toLowerCase() ===
+        String(lobby.targetPage.title).replace(/_/g, ' ').trim().toLowerCase()
+    ) {
+      hit = true;
+    }
+  }
+  if (!hit) return;
   const me = lobby.players?.find((p) => p.id === raceCtx.playerId);
   if (me?.finished) return;
   // Force progress update with location so server marks finish (link_click only path)

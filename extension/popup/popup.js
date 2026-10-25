@@ -165,6 +165,7 @@ function render(state) {
 
     if (lobby.mode === 'pick') {
       const phase = lobby.pickPhase || 'start';
+      // Show pick UI to the assigned start/target picker — not host-only
       const myTurn =
         (phase === 'start' && state.playerId === lobby.startPickerId) ||
         (phase === 'target' && state.playerId === lobby.targetPickerId);
@@ -185,6 +186,8 @@ function render(state) {
       els.pickActions.hidden = true;
       els.modeHint.textContent = 'Classic: host starts to get random start & target pages.';
     }
+  } else {
+    els.pickActions.hidden = true;
   }
 
   // Winner banner
@@ -199,8 +202,12 @@ function render(state) {
     els.winnerBanner.textContent = '';
   }
 
-  // Start button
-  if (isHost && waiting) {
+  // Start / Next round — always derived from current lobby.players[].isHost
+  // so host promotion after Leave immediately shows the button.
+  if (isHost && lobby.status === 'finished') {
+    els.btnStart.hidden = false;
+    els.btnStart.textContent = 'Next round';
+  } else if (isHost && waiting) {
     if (lobby.mode === 'pick') {
       els.btnStart.hidden = !(lobby.startPage && lobby.targetPage);
       els.btnStart.textContent = 'Start race';
@@ -341,7 +348,12 @@ els.btnJoin.addEventListener('click', () => {
 });
 
 els.btnStart.addEventListener('click', () => {
-  chrome.runtime.sendMessage({ type: 'start_race' }, refresh);
+  const lobby = latestState?.lobby;
+  if (lobby?.status === 'finished') {
+    chrome.runtime.sendMessage({ type: 'next_round' }, refresh);
+  } else {
+    chrome.runtime.sendMessage({ type: 'start_race' }, refresh);
+  }
 });
 
 els.btnLeave.addEventListener('click', () => {

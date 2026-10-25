@@ -328,6 +328,212 @@ async function pickModeFlow() {
   ws3.close();
 }
 
+async function nextRoundFlow() {
+  const host = await connect();
+  await host.wait((m) => m.type === 'hello');
+  host.send(JSON.stringify({ type: 'create_lobby', name: 'NextHost', mode: 'classic' }));
+  const created = await host.wait((m) => m.type === 'lobby_created');
+
+  const guest = await connect();
+  await guest.wait((m) => m.type === 'hello');
+  guest.send(JSON.stringify({ type: 'join_lobby', code: created.lobby.code, name: 'NextGuest' }));
+  await guest.wait((m) => m.type === 'lobby_joined');
+  await host.wait((m) => m.type === 'lobby_update');
+
+  host.send(JSON.stringify({ type: 'start_race' }));
+  const started = await host.wait((m) => m.type === 'race_started' || m.type === 'error', 20000);
+  if (started.type === 'error') throw new Error(started.message);
+  await guest.wait((m) => m.type === 'race_started', 20000);
+  const firstTarget = started.lobby.targetPage.title;
+
+  // Finish
+  host.send(
+    JSON.stringify({
+      type: 'update_progress',
+      clicks: 2,
+      currentTitle: started.lobby.targetPage.title,
+      currentUrl: started.lobby.targetPage.url,
+    })
+  );
+  await host.wait((m) => m.type === 'lobby_update' && m.lobby.status === 'finished');
+  await guest.wait((m) => m.type === 'lobby_update' && m.lobby.status === 'finished');
+  console.log('finished first race, target was:', firstTarget);
+
+  // Guest cannot next_round
+  guest.send(JSON.stringify({ type: 'next_round' }));
+  const denied = await guest.wait((m) => m.type === 'error', 5000);
+  if (!/host/i.test(denied.message || '')) throw new Error('guest next_round should be denied');
+
+  // Host next_round → classic immediately races with new pages
+  host.send(JSON.stringify({ type: 'next_round' }));
+  const again = await host.wait(
+    (m) => m.type === 'race_started' || m.type === 'error',
+    20000
+  );
+  if (again.type === 'error') throw new Error(again.message);
+  await guest.wait((m) => m.type === 'race_started', 20000);
+  if (again.lobby.status !== 'racing') throw new Error('next_round classic should be racing');
+  const me = again.lobby.players.find((p) => p.id === created.playerId);
+  if (!me || me.clicks !== 0 || me.finished) throw new Error('players not reset on next_round');
+  if (!again.lobby.startPage || !again.lobby.targetPage) throw new Error('missing pages on next round');
+  console.log('next_round classic ok →', again.lobby.startPage.title, '→', again.lobby.targetPage.title);
+
+  // Pick-mode next_round resets to waiting
+  const host2 = await connect();
+  await host2.wait((m) => m.type === 'hello');
+  host2.send(JSON.stringify({ type: 'create_lobby', name: 'PickNext', mode: 'pick' }));
+  const c2 = await host2.wait((m) => m.type === 'lobby_created');
+  host2.send(
+    JSON.stringify({
+      type: 'set_pick_page',
+      role: 'start',
+      title: 'Dog',
+      url: 'https://en.wikipedia.org/wiki/Dog',
+    })
+  );
+  await host2.wait((m) => m.type === 'lobby_update' && m.lobby.startPage);
+  // alone: host is both pickers after assignPickers — set target too
+  // After start set, phase is target; host is also targetPicker when alone
+  host2.send(
+    JSON.stringify({
+      type: 'set_pick_page',
+      role: 'target',
+      title: 'Cat',
+      url: 'https://en.wikipedia.org/wiki/Cat',
+    })
+  );
+  await host2.wait((m) => m.type === 'lobby_update' && m.lobby.pickPhase === 'ready');
+  host2.send(JSON.stringify({ type: 'start_race' }));
+  const s2 = await host2.wait((m) => m.type === 'race_started' || m.type === 'error', 15000);
+  if (s2.type === 'error') throw new Error(s2.message);
+  host2.send(
+    JSON.stringify({
+      type: 'update_progress',
+      clicks: 1,
+      currentTitle: s2.lobby.targetPage.title,
+      currentUrl: s2.lobby.targetPage.url,
+    })
+  );
+  await host2.wait((m) => m.type === 'lobby_update' && m.lobby.status === 'finished');
+  host2.send(JSON.stringify({ type: 'next_round' }));
+  const pickReset = await host2.wait(
+    (m) => m.type === 'lobby_update' && m.lobby.status === 'waiting',
+    10000
+  );
+  if (pickReset.lobby.mode !== 'pick') throw new Error('pick mode lost');
+  if (pickReset.lobby.pickPhase !== 'start') throw new Error('expected pickPhase start after next_round');
+  if (pickReset.lobby.startPage || pickReset.lobby.targetPage) {
+    throw new Error('pick pages should clear on next_round');
+  }
+  console.log('next_round pick → waiting/start ok');
+
+  host.close();
+  guest.close();
+  host2.close();
+}
+
+async function hostPromotionFlow() {
+  const host = await connect();
+  await host.wait((m) => m.type === 'hello');
+  host.send(JSON.stringify({ type: 'create_lobby', name: 'OldHost', mode: 'classic' }));
+  const created = await host.wait((m) => m.type === 'lobby_created');
+
+  const guest = await connect();
+  await guest.wait((m) => m.type === 'hello');
+  guest.send(JSON.stringify({ type: 'join_lobby', code: created.lobby.code, name: 'NewHost' }));
+  const joined = await guest.wait((m) => m.type === 'lobby_joined');
+  await host.wait((m) => m.type === 'lobby_update');
+
+  host.send(JSON.stringify({ type: 'leave_lobby' }));
+  const promoted = await guest.wait(
+    (m) =>
+      m.type === 'lobby_update' &&
+      m.lobby.players.some((p) => p.id === joined.playerId && p.isHost),
+    5000
+  );
+  const me = promoted.lobby.players.find((p) => p.id === joined.playerId);
+  if (!me?.isHost) throw new Error('guest not promoted to host');
+  if (promoted.lobby.status !== 'waiting') throw new Error('expected waiting after leave');
+  // New host is authorized to start (Wikipedia 429 is environmental, not an auth bug)
+  guest.send(JSON.stringify({ type: 'start_race' }));
+  const started = await guest.wait((m) => m.type === 'race_started' || m.type === 'error', 25000);
+  if (started.type === 'error') {
+    if (/only the host/i.test(started.message || '')) {
+      throw new Error('promoted host cannot start: ' + started.message);
+    }
+    if (/Wikipedia API/i.test(started.message || '')) {
+      console.log('host promotion ok (wiki rate-limited on start)');
+    } else {
+      throw new Error('promoted host cannot start: ' + started.message);
+    }
+  } else {
+    console.log('host promotion + start ok');
+  }
+
+  host.close();
+  guest.close();
+}
+
+async function redirectResolveFlow() {
+  const host = await connect();
+  await host.wait((m) => m.type === 'hello');
+  host.send(JSON.stringify({ type: 'create_lobby', name: 'RedirectHost', mode: 'pick' }));
+  await host.wait((m) => m.type === 'lobby_created');
+  host.send(
+    JSON.stringify({
+      type: 'set_pick_page',
+      role: 'start',
+      title: 'Dog',
+      url: 'https://en.wikipedia.org/wiki/Dog',
+    })
+  );
+  await host.wait((m) => m.type === 'lobby_update' && m.lobby.startPage);
+  host.send(
+    JSON.stringify({
+      type: 'set_pick_page',
+      role: 'target',
+      title: 'Gray wolf',
+      url: 'https://en.wikipedia.org/wiki/Gray_wolf',
+    })
+  );
+  const after = await host.wait(
+    (m) => m.type === 'lobby_update' && m.lobby.targetPage && m.lobby.pickPhase === 'ready',
+    20000
+  );
+  const targetTitle = after.lobby.targetPage.title;
+  console.log('Gray wolf resolved to:', targetTitle);
+
+  host.send(JSON.stringify({ type: 'start_race' }));
+  const started = await host.wait((m) => m.type === 'race_started' || m.type === 'error', 20000);
+  if (started.type === 'error') throw new Error(started.message);
+
+  // Finish by landing on the post-redirect canonical (Wolf), even if target
+  // was stored as Gray wolf due to a resolve miss — async canonical check wins.
+  host.send(
+    JSON.stringify({
+      type: 'update_progress',
+      clicks: 1,
+      currentTitle: 'Wolf',
+      currentUrl: 'https://en.wikipedia.org/wiki/Wolf',
+    })
+  );
+  const finished = await host.wait(
+    (m) =>
+      m.type === 'lobby_update' &&
+      m.lobby.status === 'finished' &&
+      m.lobby.players.some((p) => p.finished),
+    20000
+  );
+  if (!finished) throw new Error('redirect canonical finish failed');
+  console.log(
+    'redirect/canonical finish ok; stored target was',
+    targetTitle,
+    '→ finished on Wolf'
+  );
+
+  host.close();
+}
+
 async function main() {
   console.log('GET', HEALTH);
   const healthRes = await fetch(HEALTH);
@@ -339,6 +545,9 @@ async function main() {
   await classicRaceFlow();
   await pickModeFlow();
   await resumeSessionFlow();
+  await nextRoundFlow();
+  await hostPromotionFlow();
+  await redirectResolveFlow();
   console.log('\nSMOKE OK');
 }
 

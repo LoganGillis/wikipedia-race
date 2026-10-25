@@ -480,6 +480,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse({ ok: true });
       return;
     }
+    if (msg.type === 'next_round') {
+      send('next_round');
+      sendResponse({ ok: true });
+      return;
+    }
     if (msg.type === 'set_mode') {
       send('set_mode', { mode: msg.mode });
       sendResponse({ ok: true });
