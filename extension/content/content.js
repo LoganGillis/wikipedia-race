@@ -5,22 +5,21 @@
  *
  * Click counter:
  * - Article link click → +1 (pending flag; applied on next page show)
- * - Browser Back → −1 (floored at 0), including bfcache restores.
- *   `pageshow` (event.persisted) covers bfcache; `popstate` covers same-doc history.
- *   A path stack in sessionStorage reconciles Back/Forward without double-counting
- *   normal link clicks.
+ * - Browser Back → −1 (floored at 0), including bfcache restores via `pageshow`
+ * - Race-start / programmatic navigations do NOT count (seed + stack stores
+ *   {path, clicks} so only real link clicks increment)
  *
- * Claimed links: following a link claims that destination on the source page for
- * everyone else (live). Backing out releases that step's claim (broadcast unclaim).
- * Claimed anchors are styled red + line-through.
+ * Cursors: pageX/pageY (document space); receivers convert with scroll so
+ * cursors stick to article content while scrolling.
  *
- * Cursors: throttled mousemove → server → remote labeled pointers on the same page.
+ * Claims: take a link → red strikethrough for others; Back releases claim.
  */
 
 const STACK_KEY = '__wr_stack';
 const INDEX_KEY = '__wr_index';
 const PENDING_KEY = '__wr_pending';
 const CLAIM_EDGES_KEY = '__wr_claim_edges';
+const SEED_KEY = '__wr_seed_next';
 
 const CURSOR_COLORS = [
   '#3d8bfd', '#3dd68c', '#f5a524', '#f31260', '#a78bfa', '#22d3ee', '#fb7185',
@@ -36,6 +35,8 @@ let raceCtx = {
 
 /** @type {Map<string, HTMLElement>} */
 const cursorEls = new Map();
+/** @type {Map<string, { name: string, pageX: number, pageY: number }>} */
+const cursorPositions = new Map();
 let cursorLayer = null;
 let lastCursorSent = 0;
 let claimsStyleEl = null;
@@ -73,11 +74,18 @@ function isArticlePath(pathname) {
   }
 }
 
+/** Normalize legacy string[] stacks to {path, clicks}[]. */
 function loadStack() {
   try {
     const raw = sessionStorage.getItem(STACK_KEY);
     const stack = raw ? JSON.parse(raw) : [];
-    return Array.isArray(stack) ? stack : [];
+    if (!Array.isArray(stack)) return [];
+    return stack.map((entry, i) => {
+      if (entry && typeof entry === 'object' && entry.path) {
+        return { path: entry.path, clicks: Math.max(0, Number(entry.clicks) || 0) };
+      }
+      return { path: String(entry), clicks: i };
+    });
   } catch {
     return [];
   }
@@ -131,6 +139,26 @@ function saveClaimEdges(edges) {
   } catch (_) {}
 }
 
+function consumeSeedFlag() {
+  try {
+    if (sessionStorage.getItem(SEED_KEY) === '1') {
+      sessionStorage.removeItem(SEED_KEY);
+      return true;
+    }
+  } catch (_) {}
+  return false;
+}
+
+function resetNavForNewRace() {
+  try {
+    sessionStorage.removeItem(STACK_KEY);
+    sessionStorage.removeItem(INDEX_KEY);
+    sessionStorage.removeItem(PENDING_KEY);
+    sessionStorage.removeItem(CLAIM_EDGES_KEY);
+    sessionStorage.setItem(SEED_KEY, '1');
+  } catch (_) {}
+}
+
 function report(kind, clicks) {
   chrome.runtime.sendMessage({
     type: 'wiki_nav',
@@ -141,16 +169,15 @@ function report(kind, clicks) {
   }).catch(() => {});
 }
 
-function releaseClaimsBeyond(newIndex) {
+function releaseClaimsBeyondClicks(newClicks) {
   const edges = loadClaimEdges();
-  if (edges.length <= newIndex) return;
-  const released = edges.splice(newIndex);
+  if (edges.length <= newClicks) return;
+  const released = edges.splice(newClicks);
   saveClaimEdges(edges);
   if (!released.length) return;
   chrome.runtime
     .sendMessage({ type: 'link_unclaim', claims: released })
     .catch(() => {});
-  // Optimistically drop from local claim list (own claims)
   for (const edge of released) {
     raceCtx.claims = raceCtx.claims.filter(
       (c) =>
@@ -160,9 +187,12 @@ function releaseClaimsBeyond(newIndex) {
   refreshClaimsUi();
 }
 
+function entryPath(entry) {
+  return entry && typeof entry === 'object' ? entry.path : entry;
+}
+
 /**
- * Reconcile navigation stack on every page show (full load or bfcache).
- * Returns { clicks, kind }.
+ * Reconcile navigation stack. Clicks only increase on pending link clicks.
  */
 function reconcileNavigation() {
   const path = currentArticlePath();
@@ -170,81 +200,93 @@ function reconcileNavigation() {
   let stack = loadStack();
   let index = prevIndex;
   const pending = loadPending();
-  let kind = 'page_load';
+  const seeded = consumeSeedFlag();
 
   if (!path) {
-    return { clicks: Math.max(0, index), kind };
+    const clicks = index >= 0 && stack[index] ? stack[index].clicks : 0;
+    return { clicks, kind: 'page_load' };
+  }
+
+  // New race seed (or cleared stack before start-page navigation)
+  if (seeded || !stack.length || index < 0) {
+    stack = [{ path, clicks: 0 }];
+    index = 0;
+    savePending(null);
+    saveStack(stack, index);
+    if (seeded) saveClaimEdges([]);
+    return { clicks: 0, kind: 'page_load' };
   }
 
   if (
     pending &&
     pending.targetPath === path &&
-    (index < 0 || pending.fromPath === stack[index])
+    (index < 0 || pending.fromPath === entryPath(stack[index]))
   ) {
-    stack = index >= 0 ? stack.slice(0, index + 1) : [];
-    stack.push(path);
+    const prevClicks = stack[index]?.clicks ?? 0;
+    stack = stack.slice(0, index + 1);
+    stack.push({ path, clicks: prevClicks + 1 });
     index = stack.length - 1;
     savePending(null);
     saveStack(stack, index);
-    // Keep claim edges aligned with depth (pushed on click)
     const edges = loadClaimEdges();
-    if (edges.length > index) {
-      edges.length = index;
+    if (edges.length > prevClicks + 1) {
+      edges.length = prevClicks + 1;
       saveClaimEdges(edges);
     }
-    return { clicks: index, kind: 'link_click' };
+    return { clicks: prevClicks + 1, kind: 'link_click' };
   }
 
-  if (stack.length) {
-    let found = -1;
-    if (index >= 0 && index < stack.length && stack[index] === path) {
-      found = index;
-    } else {
-      for (let i = index - 1; i >= 0; i--) {
-        if (stack[i] === path) {
+  // Match existing history entry (Back / Forward / refresh / bfcache)
+  let found = -1;
+  if (index >= 0 && index < stack.length && entryPath(stack[index]) === path) {
+    found = index;
+  } else {
+    for (let i = index - 1; i >= 0; i--) {
+      if (entryPath(stack[i]) === path) {
+        found = i;
+        break;
+      }
+    }
+    if (found < 0) {
+      for (let i = index + 1; i < stack.length; i++) {
+        if (entryPath(stack[i]) === path) {
           found = i;
           break;
         }
       }
-      if (found < 0) {
-        for (let i = index + 1; i < stack.length; i++) {
-          if (stack[i] === path) {
-            found = i;
-            break;
-          }
+    }
+    if (found < 0) {
+      for (let i = stack.length - 1; i >= 0; i--) {
+        if (entryPath(stack[i]) === path) {
+          found = i;
+          break;
         }
       }
-      if (found < 0) found = stack.lastIndexOf(path);
-    }
-    if (found >= 0) {
-      savePending(null);
-      saveStack(stack, found);
-      if (found < prevIndex) kind = 'back';
-      else if (found > prevIndex) kind = 'forward_nav';
-      else kind = 'page_load';
-      if (found < prevIndex) {
-        releaseClaimsBeyond(found);
-      }
-      return { clicks: found, kind };
     }
   }
 
-  if (!stack.length || index < 0) {
-    stack = [path];
-    index = 0;
+  if (found >= 0) {
     savePending(null);
-    saveStack(stack, index);
-    saveClaimEdges([]);
-    return { clicks: 0, kind: 'page_load' };
+    saveStack(stack, found);
+    const clicks = stack[found].clicks;
+    let kind = 'page_load';
+    if (found < prevIndex) kind = 'back';
+    else if (found > prevIndex) kind = 'forward_nav';
+    if (found < prevIndex) {
+      releaseClaimsBeyondClicks(clicks);
+    }
+    return { clicks, kind };
   }
 
-  // Unknown path without pending — treat as new forward step
+  // Unknown path without pending (race start nav, typed URL, redirect):
+  // keep the same click count — do NOT increment.
+  const prevClicks = stack[index]?.clicks ?? 0;
   stack = stack.slice(0, index + 1);
-  stack.push(path);
+  stack.push({ path, clicks: prevClicks });
   index = stack.length - 1;
   savePending(null);
   saveStack(stack, index);
-  return { clicks: index, kind: 'forward_nav' };
+  return { clicks: prevClicks, kind: 'page_load' };
 }
 
 function onPageShow() {
@@ -294,10 +336,11 @@ document.addEventListener(
     savePending({ targetPath, fromPath });
 
     if (raceCtx.racing) {
+      const stack = loadStack();
+      const idx = loadIndex();
+      const curClicks = idx >= 0 && stack[idx] ? stack[idx].clicks : 0;
       const edges = loadClaimEdges();
-      // Truncate any forward claim edges, then push this step
-      const idx = Math.max(0, loadIndex());
-      edges.length = idx; // edges[0] corresponds to navigating to stack[1]
+      edges.length = curClicks;
       edges.push({ sourcePath: fromPath, targetPath });
       saveClaimEdges(edges);
 
@@ -322,7 +365,6 @@ window.addEventListener('popstate', () => {
   onPageShow();
 });
 
-// If this script injected after pageshow (rare), still reconcile once.
 setTimeout(() => {
   if (!bootstrapped) onPageShow();
 }, 0);
@@ -342,6 +384,8 @@ function applyState(state) {
   raceCtx.playerName = state.playerName || '';
   raceCtx.racing = lobby?.status === 'racing';
   if (Array.isArray(lobby?.claims)) raceCtx.claims = lobby.claims;
+  // Do not reset nav stack here — that would wipe mid-race on script reinject.
+  // Race start uses claims_reset + session seed (see service worker).
   if (!raceCtx.racing) {
     clearCursors();
   }
@@ -367,7 +411,6 @@ function refreshClaimsUi() {
   const sourcePath = currentArticlePath();
   document.querySelectorAll('a.wr-claimed-link').forEach((el) => {
     el.classList.remove('wr-claimed-link');
-    el.removeAttribute('data-wr-claim');
     if (el.dataset.wrTitleOrig != null) {
       el.title = el.dataset.wrTitleOrig;
       delete el.dataset.wrTitleOrig;
@@ -383,22 +426,21 @@ function refreshClaimsUi() {
   const byTarget = new Map();
   for (const c of claimedHere) byTarget.set(c.targetPath, c);
 
-  const roots = document.querySelectorAll(
-    '#content a[href], #bodyContent a[href], #mw-content-text a[href]'
-  );
-  roots.forEach((a) => {
-    const tp = articlePathFromUrl(a.href);
-    if (!tp || !byTarget.has(tp)) return;
-    const claim = byTarget.get(tp);
-    a.classList.add('wr-claimed-link');
-    if (a.dataset.wrTitleOrig == null) {
-      a.dataset.wrTitleOrig = a.title || '';
-    }
-    a.title =
-      claim.playerId === raceCtx.playerId
-        ? 'You took this link (others see it as taken)'
-        : `Taken by ${claim.playerName || 'another player'}`;
-  });
+  document
+    .querySelectorAll('#content a[href], #bodyContent a[href], #mw-content-text a[href]')
+    .forEach((a) => {
+      const tp = articlePathFromUrl(a.href);
+      if (!tp || !byTarget.has(tp)) return;
+      const claim = byTarget.get(tp);
+      a.classList.add('wr-claimed-link');
+      if (a.dataset.wrTitleOrig == null) {
+        a.dataset.wrTitleOrig = a.title || '';
+      }
+      a.title =
+        claim.playerId === raceCtx.playerId
+          ? 'You took this link (others see it as taken)'
+          : `Taken by ${claim.playerName || 'another player'}`;
+    });
 }
 
 function ensureClaimsStyle() {
@@ -428,12 +470,13 @@ function ensureClaimsStyle() {
     .wr-cursor {
       position: absolute;
       transform: translate(-2px, -2px);
-      transition: left 40ms linear, top 40ms linear;
+      transition: left 50ms linear, top 50ms linear;
       display: flex;
       align-items: center;
       gap: 4px;
       will-change: left, top;
     }
+    .wr-cursor.is-offscreen { visibility: hidden; }
     .wr-cursor svg { display: block; filter: drop-shadow(0 1px 1px rgba(0,0,0,.4)); }
     .wr-cursor-label {
       font: 600 11px/1.2 system-ui, sans-serif;
@@ -464,9 +507,20 @@ function colorForId(id) {
   return CURSOR_COLORS[h % CURSOR_COLORS.length];
 }
 
-function upsertCursor(playerId, playerName, x, y) {
+function upsertCursor(playerId, playerName, pageX, pageY) {
   if (!raceCtx.racing) return;
   if (playerId && playerId === raceCtx.playerId) return;
+  cursorPositions.set(playerId, {
+    name: playerName || 'Player',
+    pageX: Number(pageX) || 0,
+    pageY: Number(pageY) || 0,
+  });
+  renderCursor(playerId);
+}
+
+function renderCursor(playerId) {
+  const pos = cursorPositions.get(playerId);
+  if (!pos) return;
   const layer = ensureCursorLayer();
   let el = cursorEls.get(playerId);
   if (!el) {
@@ -483,12 +537,27 @@ function upsertCursor(playerId, playerName, x, y) {
     layer.appendChild(el);
     cursorEls.set(playerId, el);
   }
-  el.querySelector('.wr-cursor-label').textContent = playerName || 'Player';
-  el.style.left = `${x * window.innerWidth}px`;
-  el.style.top = `${y * window.innerHeight}px`;
+  el.querySelector('.wr-cursor-label').textContent = pos.name;
+  // Convert document coords → viewport for the fixed overlay
+  const left = pos.pageX - window.scrollX;
+  const top = pos.pageY - window.scrollY;
+  el.style.left = `${left}px`;
+  el.style.top = `${top}px`;
+  const margin = 40;
+  const off =
+    left < -margin ||
+    top < -margin ||
+    left > window.innerWidth + margin ||
+    top > window.innerHeight + margin;
+  el.classList.toggle('is-offscreen', off);
+}
+
+function repositionAllCursors() {
+  for (const id of cursorPositions.keys()) renderCursor(id);
 }
 
 function removeCursor(playerId) {
+  cursorPositions.delete(playerId);
   const el = cursorEls.get(playerId);
   if (el) {
     el.remove();
@@ -498,6 +567,7 @@ function removeCursor(playerId) {
 
 function clearCursors() {
   for (const id of [...cursorEls.keys()]) removeCursor(id);
+  cursorPositions.clear();
   if (cursorLayer) {
     cursorLayer.remove();
     cursorLayer = null;
@@ -514,14 +584,18 @@ document.addEventListener(
     chrome.runtime
       .sendMessage({
         type: 'cursor_update',
-        x: ev.clientX / Math.max(1, window.innerWidth),
-        y: ev.clientY / Math.max(1, window.innerHeight),
+        // Document/page space so scroll doesn't desync remote cursors
+        x: ev.pageX,
+        y: ev.pageY,
         pagePath: currentArticlePath(),
       })
       .catch(() => {});
   },
   { passive: true }
 );
+
+window.addEventListener('scroll', repositionAllCursors, { passive: true });
+window.addEventListener('resize', repositionAllCursors);
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'state' && msg.state) {
@@ -570,7 +644,7 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
   if (msg.type === 'claims_reset') {
     raceCtx.claims = [];
-    saveClaimEdges([]);
+    resetNavForNewRace();
     refreshClaimsUi();
     clearCursors();
   }

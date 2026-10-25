@@ -122,14 +122,15 @@ async function main() {
   ws.send(
     JSON.stringify({
       type: 'cursor_update',
-      x: 0.25,
-      y: 0.75,
+      x: 420.5,
+      y: 880,
       pagePath: sourcePathClean,
     })
   );
   const cursor = await cursorWait;
   console.log('cursor:', cursor.playerName, cursor.x, cursor.y);
   if (cursor.playerId !== created.playerId) throw new Error('cursor playerId mismatch');
+  if (cursor.x !== 420.5 || cursor.y !== 880) throw new Error('page-space cursor coords mangled');
 
   const unclaimWait = ws2.wait((m) => m.type === 'link_unclaimed');
   ws.send(

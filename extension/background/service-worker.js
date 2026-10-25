@@ -134,9 +134,9 @@ async function handleServerMessage(msg) {
       break;
     case 'race_started':
       await saveState({ lobby: msg.lobby, lastError: null });
-      forwardToWikiTabs({ type: 'claims_reset' });
+      // openRaceTab seeds nav (0 clicks) then navigates to start page
       if (msg.lobby?.startPage?.url) {
-        openRaceTab(msg.lobby.startPage.url);
+        await openRaceTab(msg.lobby.startPage.url);
       }
       break;
     case 'lobby_update':
@@ -207,7 +207,33 @@ async function removeClaims(list, sourcePath, targetPath) {
   await saveState({ lobby: { ...state.lobby, claims } });
 }
 
+/** Clear click stack in open wiki tabs and mark next load as race seed (0 clicks). */
+async function seedRaceNavigationInWikiTabs() {
+  const tabs = await chrome.tabs.query({ url: ['https://*.wikipedia.org/*'] });
+  for (const tab of tabs) {
+    if (tab.id == null) continue;
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => {
+          try {
+            sessionStorage.removeItem('__wr_stack');
+            sessionStorage.removeItem('__wr_index');
+            sessionStorage.removeItem('__wr_pending');
+            sessionStorage.removeItem('__wr_claim_edges');
+            sessionStorage.setItem('__wr_seed_next', '1');
+          } catch (_) {}
+        },
+      });
+    } catch (_) {
+      /* tab may not allow scripting yet */
+    }
+    chrome.tabs.sendMessage(tab.id, { type: 'claims_reset' }).catch(() => {});
+  }
+}
+
 async function openRaceTab(url) {
+  await seedRaceNavigationInWikiTabs();
   const tabs = await chrome.tabs.query({ url: ['https://*.wikipedia.org/*'] });
   if (tabs[0]?.id) {
     await chrome.tabs.update(tabs[0].id, { url, active: true });
@@ -338,10 +364,29 @@ async function onWikiNav(msg) {
   // Prefer absolute clicksHint from content script (nav stack) to avoid drift
   if (typeof msg.clicksHint === 'number' && Number.isFinite(msg.clicksHint)) {
     clicks = Math.max(0, Math.floor(msg.clicksHint));
-  } else if (msg.kind === 'link_click' || msg.kind === 'forward_nav') {
+  } else if (msg.kind === 'link_click') {
     clicks += 1;
   } else if (msg.kind === 'back') {
     clicks = Math.max(0, clicks - 1);
+  } else if (msg.kind === 'forward_nav') {
+    // History forward may restore a higher stack clicksHint; without hint, +1
+    clicks += 1;
+  }
+  // page_load with hint applies absolute value (including race seed → 0)
+
+  // Optimistic local update so popup CLICKS matches roster without waiting on WS RTT
+  if (state.lobby.players && state.playerId) {
+    const players = state.lobby.players.map((p) =>
+      p.id === state.playerId
+        ? {
+            ...p,
+            clicks,
+            currentTitle: msg.title || p.currentTitle,
+            currentUrl: msg.url || p.currentUrl,
+          }
+        : p
+    );
+    await saveState({ lobby: { ...state.lobby, players } });
   }
 
   send('update_progress', {

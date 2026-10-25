@@ -1,9 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Wikipedia Race",
-  "version": "1.0.0",
-  "description": "Multiplayer Wikipedia racing — join a lobby, race from a random start page to a target.",
-  "permissions": ["storage", "tabs", "alarms"],
+  "version": "1.0.1",
+  "description": "Multiplayer Wikipedia racing \u2014 join a lobby, race from a random start page to a target.",
+  "permissions": [
+    "storage",
+    "tabs",
+    "alarms",
+    "scripting"
+  ],
   "host_permissions": [
     "https://*.wikipedia.org/*",
     "http://localhost/*",
@@ -31,8 +36,12 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://*.wikipedia.org/*"],
-      "js": ["content/content.js"],
+      "matches": [
+        "https://*.wikipedia.org/*"
+      ],
+      "js": [
+        "content/content.js"
+      ],
       "run_at": "document_idle"
     }
   ]

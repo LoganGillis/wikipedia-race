@@ -14,7 +14,7 @@ This repo contains:
 - Click counter: **+1** per article link navigation; **browser Back** undoes a click (never below 0), including bfcache restores
 - **Stopwatch** counting up from race start (not a countdown)
 - Extension popup shows live: lobby code, your name, connection status, start/target title+URL, clicks, stopwatch, player list / race status
-- **Live shared cursors** during a race (labeled pointers on the same Wikipedia page)
+- **Live shared cursors** during a race (labeled pointers in **document/page space**, so they track content while scrolling)
 - **Claimed links**: when you take an in-article link, others still on that page see it **red + crossed out** and cannot follow it; **Backing out releases the claim** so others can take it again
 
 ## Requirements
@@ -96,6 +96,17 @@ wikipedia-race/
 - No auth, skins, avatars, or persistent leaderboards yet
 - Click counting relies on content-script heuristics + `sessionStorage` / `history.state`; edge cases (middle-click, external redirects) are out of MVP scope
 - Remote server needs `host_permissions` updated if not localhost
+
+
+## Deploy (VPS)
+
+If the game server runs on a VPS (e.g. under `~/wikipedia-race`):
+
+```bash
+cd ~/wikipedia-race && git pull && sudo systemctl restart wikipedia-race
+```
+
+Reload the Chrome extension (chrome://extensions → Reload) after pulling extension changes.
 
 ## License
 

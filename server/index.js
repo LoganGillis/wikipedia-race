@@ -366,6 +366,7 @@ function handleCursor(ws, msg) {
   const x = Number(msg.x);
   const y = Number(msg.y);
   if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+  // Page-space pixel coords (pageX/pageY); do not clamp to viewport 0..1
   const pagePath = normalizeWikiPath(msg.pagePath) || '';
   broadcastRaw(
     lobby,
@@ -373,8 +374,8 @@ function handleCursor(ws, msg) {
     {
       playerId,
       playerName: player.name,
-      x: Math.min(1, Math.max(0, x)),
-      y: Math.min(1, Math.max(0, y)),
+      x: Math.max(0, x),
+      y: Math.max(0, y),
       pagePath,
     },
     playerId
