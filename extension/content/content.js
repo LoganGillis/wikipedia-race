@@ -18,8 +18,9 @@ globalThis.__wrContentLoaded = true;
  * - Race-start / programmatic navigations do NOT count (seed + stack stores
  *   {path, clicks} so only real link clicks increment)
  *
- * Cursors: pageX/pageY (document space); receivers convert with scroll so
- * cursors stick to article content while scrolling.
+ * Cursors: offsets relative to #mw-content-text (article root); receivers
+ * place via that node's getBoundingClientRect so layout/sidebar drift is low.
+ * Remote cursors only render when pagePath matches the current article.
  *
  * Claims: take a link → red strikethrough for others; Back releases claim.
  */
@@ -45,7 +46,7 @@ let raceCtx = {
 
 /** @type {Map<string, HTMLElement>} */
 const cursorEls = new Map();
-/** @type {Map<string, { name: string, pageX: number, pageY: number }>} */
+/** @type {Map<string, { name: string, contentX: number, contentY: number }>} */
 const cursorPositions = new Map();
 let cursorLayer = null;
 let lastCursorSent = 0;
@@ -328,6 +329,7 @@ function onPageShow() {
   if (kind === 'link_click') {
     maybeAnnounceTargetReached();
   }
+  clearCursors();
   refreshClaimsUi();
   
 /* Keep MV3 service worker + WS alive while on Wikipedia during a lobby/race */
@@ -575,7 +577,8 @@ function ensureClaimsStyle() {
     }
     .wr-cursor {
       position: absolute;
-      transform: translate(-3px, -3px);
+      /* Tip of the arrow path is ~top-left of the SVG; pin that to (left, top). */
+      transform: translate(-1px, -1px);
       transition: left 40ms linear, top 40ms linear;
       display: flex;
       align-items: center;
@@ -600,6 +603,32 @@ function ensureClaimsStyle() {
   (document.head || document.documentElement).appendChild(claimsStyleEl);
 }
 
+function getContentRoot() {
+  return (
+    document.querySelector('#mw-content-text') ||
+    document.querySelector('#bodyContent') ||
+    document.querySelector('#content') ||
+    document.documentElement
+  );
+}
+
+/** Pointer → offsets relative to the article content root (viewport-stable via rect). */
+function pointerToContentOffset(clientX, clientY) {
+  const rect = getContentRoot().getBoundingClientRect();
+  return {
+    x: clientX - rect.left,
+    y: clientY - rect.top,
+  };
+}
+
+function contentOffsetToViewport(contentX, contentY) {
+  const rect = getContentRoot().getBoundingClientRect();
+  return {
+    left: rect.left + contentX,
+    top: rect.top + contentY,
+  };
+}
+
 function ensureCursorLayer() {
   if (cursorLayer && cursorLayer.isConnected) return cursorLayer;
   ensureClaimsStyle();
@@ -616,13 +645,13 @@ function colorForId(id) {
   return CURSOR_COLORS[h % CURSOR_COLORS.length];
 }
 
-function upsertCursor(playerId, playerName, pageX, pageY) {
+function upsertCursor(playerId, playerName, contentX, contentY) {
   if (!raceCtx.racing && sessionStorage.getItem('__wr_racing') !== '1') return;
   if (playerId && raceCtx.playerId && playerId === raceCtx.playerId) return;
   cursorPositions.set(playerId, {
     name: playerName || 'Player',
-    pageX: Number(pageX) || 0,
-    pageY: Number(pageY) || 0,
+    contentX: Number(contentX) || 0,
+    contentY: Number(contentY) || 0,
   });
   renderCursor(playerId);
 }
@@ -647,9 +676,8 @@ function renderCursor(playerId) {
     cursorEls.set(playerId, el);
   }
   el.querySelector('.wr-cursor-label').textContent = pos.name;
-  // Convert document coords → viewport for the fixed overlay
-  const left = pos.pageX - window.scrollX;
-  const top = pos.pageY - window.scrollY;
+  // Content-root offsets → viewport for the fixed overlay (survives scroll/resize)
+  const { left, top } = contentOffsetToViewport(pos.contentX, pos.contentY);
   el.style.left = `${left}px`;
   el.style.top = `${top}px`;
   const margin = 40;
@@ -692,12 +720,13 @@ document.addEventListener(
     if (now - lastCursorSent < 50) return; // ~20 Hz
     lastCursorSent = now;
     const pagePath = currentArticlePath();
+    const { x, y } = pointerToContentOffset(ev.clientX, ev.clientY);
     chrome.runtime
       .sendMessage({
         type: 'cursor_update',
-        // Document/page space so scroll doesn't desync remote cursors
-        x: ev.pageX,
-        y: ev.pageY,
+        // Offsets relative to #mw-content-text (or bodyContent/content fallback)
+        x,
+        y,
         pagePath,
       })
       .catch(() => {});
@@ -717,11 +746,11 @@ chrome.runtime.onMessage.addListener((msg) => {
     if (!raceCtx.racing && sessionStorage.getItem('__wr_racing') !== '1') return;
     raceCtx.racing = true;
     const myPath = currentArticlePath();
-    const remotePath = canonicalWikiPath(msg.pagePath) || msg.pagePath;
-    // Prefer same-page cursors; if path missing/mismatch but both racing, still show
-    // so a canonicalize miss does not make cursors "vanish".
-    if (remotePath && myPath && !pathsEqual(remotePath, myPath)) {
-      // Keep a dimmed/off-page marker? Show anyway — QA said filter was too aggressive.
+    const remotePath = msg.pagePath ? canonicalWikiPath(msg.pagePath) : null;
+    // Different article (or missing pagePath) → hide; never show cross-page cursors
+    if (!remotePath || !myPath || !pathsEqual(remotePath, myPath)) {
+      removeCursor(msg.playerId);
+      return;
     }
     upsertCursor(msg.playerId, msg.playerName, msg.x, msg.y);
     return;
