@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Wikipedia Race</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="header">
+    <h1>Wikipedia Race</h1>
+    <p id="connection" class="status status-disconnected">Disconnected</p>
+  </header>
+
+  <section id="setup" class="card">
+    <label>
+      Server URL
+      <input id="serverUrl" type="text" placeholder="ws://localhost:3847/ws" spellcheck="false" />
+    </label>
+    <label>
+      Your name
+      <input id="playerName" type="text" maxlength="24" placeholder="Player" />
+    </label>
+    <div class="row">
+      <button id="btnConnect" type="button" class="secondary">Connect</button>
+      <button id="btnCreate" type="button">Create lobby</button>
+    </div>
+    <div class="row join-row">
+      <input id="joinCode" type="text" maxlength="8" placeholder="CODE" class="code-input" />
+      <button id="btnJoin" type="button">Join</button>
+    </div>
+    <p id="error" class="error" hidden></p>
+  </section>
+
+  <section id="lobbyPanel" class="card" hidden>
+    <div class="kv">
+      <span class="k">Lobby</span>
+      <span id="lobbyCode" class="v mono"></span>
+    </div>
+    <div class="kv">
+      <span class="k">You</span>
+      <span id="youName" class="v"></span>
+    </div>
+    <div class="kv">
+      <span class="k">Status</span>
+      <span id="raceStatus" class="v"></span>
+    </div>
+
+    <div id="raceMeta" hidden>
+      <hr />
+      <div class="kv">
+        <span class="k">Start</span>
+        <a id="startPage" class="v link" href="#" target="_blank" rel="noreferrer"></a>
+      </div>
+      <div class="kv">
+        <span class="k">Target</span>
+        <a id="targetPage" class="v link" href="#" target="_blank" rel="noreferrer"></a>
+      </div>
+      <div class="kv">
+        <span class="k">Clicks</span>
+        <span id="clickCount" class="v big mono">0</span>
+      </div>
+      <div class="kv">
+        <span class="k">Stopwatch</span>
+        <span id="stopwatch" class="v big mono">00:00.0</span>
+      </div>
+    </div>
+
+    <h2 class="players-title">Players</h2>
+    <ul id="playerList" class="players"></ul>
+
+    <div class="row">
+      <button id="btnStart" type="button" hidden>Start race</button>
+      <button id="btnLeave" type="button" class="secondary">Leave lobby</button>
+    </div>
+  </section>
+
+  <script src="popup.js"></script>
+</body>
+</html>
