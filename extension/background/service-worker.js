@@ -26,16 +26,32 @@ async function loadState() {
   return { ...defaultState(), ...(stored.raceState || {}) };
 }
 
+// Serialize saves — join sends lobby_joined + lobby_update back-to-back; without
+// a queue the second loadState can overwrite playerId with a stale null.
+let saveChain = Promise.resolve();
+
 async function saveState(partial) {
-  const current = await loadState();
-  const next = { ...current, ...partial };
-  await chrome.storage.session.set({ raceState: next });
-  await chrome.storage.local.set({
-    serverUrl: next.serverUrl,
-    playerName: next.playerName,
-  });
-  broadcastToExtension({ type: 'state', state: next });
-  return next;
+  const run = async () => {
+    const current = await loadState();
+    const next = { ...current, ...partial };
+    // Never clobber a known playerId with null/undefined from a partial update.
+    if (next.playerId == null && current.playerId) {
+      next.playerId = current.playerId;
+    }
+    await chrome.storage.session.set({ raceState: next });
+    await chrome.storage.local.set({
+      serverUrl: next.serverUrl,
+      playerName: next.playerName,
+    });
+    broadcastToExtension({ type: 'state', state: next });
+    return next;
+  };
+  const p = saveChain.then(run, run);
+  saveChain = p.then(
+    () => undefined,
+    () => undefined
+  );
+  return p;
 }
 
 function broadcastToExtension(msg) {
@@ -267,7 +283,22 @@ async function handleServerMessage(msg) {
     case 'lobby_update':
     case 'race_preparing':
       if (msg.lobby) {
-        await saveState({ lobby: msg.lobby });
+        const cur = await loadState();
+        const patch = { lobby: msg.lobby };
+        // Recover playerId if a raced save cleared it — match roster by name.
+        if (!cur.playerId && cur.playerName && Array.isArray(msg.lobby.players)) {
+          const mine = msg.lobby.players.find(
+            (p) =>
+              String(p.name || '')
+                .trim()
+                .toLowerCase() ===
+              String(cur.playerName || '')
+                .trim()
+                .toLowerCase()
+          );
+          if (mine?.id) patch.playerId = mine.id;
+        }
+        await saveState(patch);
         if (msg.lobby.status === 'racing') {
           await ensureOffscreen();
           await ensureAllWikiContentInjected();
@@ -376,6 +407,43 @@ async function preferRaceTab() {
   }
   const tabs = await listWikiTabs();
   return tabs[0] || null;
+}
+
+/** Best Wikipedia article tab for Pick "Use current tab" (popup may steal focus). */
+async function getWikiTabForPick() {
+  const isArticle = (url) => Boolean(url && /https?:\/\/[^/]*wikipedia\.org\/wiki\//i.test(url));
+  try {
+    const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (active && isArticle(active.url)) return active;
+  } catch (_) {}
+  try {
+    const focused = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    const hit = focused.find((t) => isArticle(t.url));
+    if (hit) return hit;
+  } catch (_) {}
+  try {
+    const inWin = await chrome.tabs.query({ currentWindow: true });
+    const wikiInWin = inWin.filter((t) => isArticle(t.url));
+    if (wikiInWin.length) {
+      wikiInWin.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+      return wikiInWin[0];
+    }
+  } catch (_) {}
+  if (lastRaceTabId != null) {
+    try {
+      const tab = await chrome.tabs.get(lastRaceTabId);
+      if (tab && isArticle(tab.url)) return tab;
+    } catch (_) {
+      lastRaceTabId = null;
+    }
+  }
+  const all = await listWikiTabs();
+  const articles = all.filter((t) => isArticle(t.url));
+  if (articles.length) {
+    articles.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+    return articles[0];
+  }
+  return null;
 }
 
 async function openRaceTab(url, { seed = true } = {}) {
@@ -491,12 +559,33 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       return;
     }
     if (msg.type === 'set_pick_page') {
-      send('set_pick_page', {
+      if (!(await ensureConnected())) {
+        sendResponse({ ok: false, error: 'Not connected' });
+        return;
+      }
+      await tryResumeSession();
+      const ok = send('set_pick_page', {
         role: msg.role,
         title: msg.title,
         url: msg.url,
       });
-      sendResponse({ ok: true });
+      sendResponse(ok ? { ok: true } : { ok: false, error: 'Not connected' });
+      return;
+    }
+    if (msg.type === 'get_wiki_tab_for_pick') {
+      const tab = await getWikiTabForPick();
+      if (!tab) {
+        sendResponse({ ok: false, error: 'Open a Wikipedia article tab first', tab: null });
+        return;
+      }
+      sendResponse({
+        ok: true,
+        tab: {
+          id: tab.id,
+          url: tab.url,
+          title: tab.title || '',
+        },
+      });
       return;
     }
     if (msg.type === 'leave_lobby') {

@@ -280,6 +280,21 @@ async function pickModeFlow() {
   if (afterStart.lobby.pickPhase !== 'target') throw new Error('expected target phase');
   console.log('pick start set:', afterStart.lobby.startPage.title);
 
+  // Wrong role during target phase must be rejected (phase gate).
+  targetWs.send(
+    JSON.stringify({
+      type: 'set_pick_page',
+      role: 'start',
+      title: 'Should Fail',
+      url: 'https://en.wikipedia.org/wiki/Should_Fail',
+    })
+  );
+  const wrongRole = await targetWs.wait((m) => m.type === 'error', 5000);
+  if (!/picking target|not your turn|role/i.test(wrongRole.message || '')) {
+    throw new Error('expected wrong-role error, got: ' + wrongRole.message);
+  }
+  console.log('wrong-role rejected:', wrongRole.message);
+
   targetWs.send(
     JSON.stringify({
       type: 'set_pick_page',

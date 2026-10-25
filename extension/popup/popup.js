@@ -44,6 +44,8 @@ let nameDraft = '';
 let nameDirty = false;
 let serverUrlDraft = '';
 let serverUrlDirty = false;
+let pickUrlDraft = '';
+let pickUrlDirty = false;
 let hydrated = false;
 
 function setConnectionBadge(status) {
@@ -88,6 +90,15 @@ function playerNameById(lobby, id) {
   return lobby.players?.find((p) => p.id === id)?.name || 'Player';
 }
 
+/** Resolve our player id; recover from roster by name if storage lost it. */
+function selfPlayerId(state, lobby) {
+  if (state?.playerId) return state.playerId;
+  const myName = (state?.playerName || nameDraft || '').trim().toLowerCase();
+  if (!lobby?.players || !myName) return null;
+  const hit = lobby.players.find((p) => p.name.trim().toLowerCase() === myName);
+  return hit?.id || null;
+}
+
 function render(state) {
   latestState = state;
   setConnectionBadge(state.connectionStatus || 'disconnected');
@@ -106,6 +117,14 @@ function render(state) {
       const show = nameDraft || state.playerName || '';
       if (els.playerName.value !== show) els.playerName.value = show;
     }
+    // Never fight #pickUrl while the picker is typing (1s refresh + state pushes).
+    if (
+      !pickUrlDirty &&
+      document.activeElement !== els.pickUrl &&
+      els.pickUrl.value !== pickUrlDraft
+    ) {
+      els.pickUrl.value = pickUrlDraft;
+    }
   }
 
   if (state.lastError) {
@@ -120,6 +139,9 @@ function render(state) {
   if (!lobby) {
     els.setup.hidden = false;
     els.lobbyPanel.hidden = true;
+    pickUrlDraft = '';
+    pickUrlDirty = false;
+    if (els.pickUrl) els.pickUrl.value = '';
     if (stopwatchTimer) {
       clearInterval(stopwatchTimer);
       stopwatchTimer = null;
@@ -131,7 +153,8 @@ function render(state) {
   els.lobbyPanel.hidden = false;
   els.lobbyCode.textContent = lobby.code;
 
-  const me = lobby.players?.find((p) => p.id === state.playerId);
+  const meId = selfPlayerId(state, lobby);
+  const me = lobby.players?.find((p) => p.id === meId);
   els.youName.textContent = me?.name || state.playerName || nameDraft || '—';
   els.modeLabel.textContent = lobby.mode === 'pick' ? 'Pick' : 'Classic';
 
@@ -165,10 +188,12 @@ function render(state) {
 
     if (lobby.mode === 'pick') {
       const phase = lobby.pickPhase || 'start';
-      // Show pick UI to the assigned start/target picker — not host-only
-      const myTurn =
-        (phase === 'start' && state.playerId === lobby.startPickerId) ||
-        (phase === 'target' && state.playerId === lobby.targetPickerId);
+      // Show pick UI to the assigned start/target picker — not host-only.
+      // Fall back to matching by name if playerId was lost (join race).
+      const meId = selfPlayerId(state, lobby);
+      const pickerId = phase === 'target' ? lobby.targetPickerId : lobby.startPickerId;
+      let myTurn = Boolean(meId && meId === pickerId);
+      if (phase === 'ready') myTurn = false;
       els.pickActions.hidden = !myTurn;
       if (phase === 'start') {
         els.modeHint.textContent = myTurn
@@ -367,29 +392,97 @@ els.btnModePick.addEventListener('click', () => {
   chrome.runtime.sendMessage({ type: 'set_mode', mode: 'pick' }, refresh);
 });
 
+function pickRoleForSubmit(lobby) {
+  if (!lobby || lobby.mode !== 'pick') return null;
+  const me = selfPlayerId(latestState, lobby);
+  if (!me) return null;
+  const phase = lobby.pickPhase;
+  if (phase === 'ready') return null;
+  const isStart = me === lobby.startPickerId;
+  const isTarget = me === lobby.targetPickerId;
+  // Dedicated target picker (second player) must never send role:'start'.
+  if (isTarget && !isStart) return 'target';
+  if (isStart && !isTarget) return 'start';
+  // Solo host is both pickers — follow phase.
+  if (phase === 'target' && isTarget) return 'target';
+  if ((phase === 'start' || !phase) && isStart) return 'start';
+  if (isTarget) return 'target';
+  if (isStart) return 'start';
+  return null;
+}
+
 function submitPick(title, url) {
   const lobby = latestState?.lobby;
   if (!lobby || lobby.mode !== 'pick') return;
-  const role = lobby.pickPhase === 'target' ? 'target' : 'start';
-  chrome.runtime.sendMessage({ type: 'set_pick_page', role, title, url }, refresh);
-}
-
-els.btnSubmitPick.addEventListener('click', () => {
-  const raw = els.pickUrl.value.trim();
-  if (!raw) return;
-  if (/^https?:\/\//i.test(raw)) submitPick('', raw);
-  else submitPick(raw, '');
-});
-
-els.btnUseTab.addEventListener('click', async () => {
-  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  const tab = tabs[0];
-  if (!tab?.url || !/wikipedia\.org\/wiki\//i.test(tab.url)) {
+  const role = pickRoleForSubmit(lobby);
+  if (!role) {
     els.error.hidden = false;
-    els.error.textContent = 'Open a Wikipedia article tab first';
+    els.error.textContent = 'Not your turn to pick a page';
     return;
   }
-  submitPick(tab.title?.replace(/ - Wikipedia$/i, '') || '', tab.url);
+  chrome.runtime.sendMessage({ type: 'set_pick_page', role, title, url }, (res) => {
+    if (chrome.runtime.lastError) {
+      els.error.hidden = false;
+      els.error.textContent = chrome.runtime.lastError.message || 'Failed to set page';
+      refresh();
+      return;
+    }
+    if (res && res.ok === false) {
+      els.error.hidden = false;
+      els.error.textContent = res.error || 'Failed to set page';
+      refresh();
+      return;
+    }
+    pickUrlDraft = '';
+    pickUrlDirty = false;
+    els.pickUrl.value = '';
+    refresh();
+  });
+}
+
+function submitPickFromInput() {
+  const raw = (els.pickUrl.value || pickUrlDraft || '').trim();
+  if (!raw) return;
+  pickUrlDraft = els.pickUrl.value;
+  pickUrlDirty = true;
+  if (/^https?:\/\//i.test(raw)) submitPick('', raw);
+  else submitPick(raw, '');
+}
+
+els.pickUrl.addEventListener('input', () => {
+  pickUrlDraft = els.pickUrl.value;
+  pickUrlDirty = true;
+});
+els.pickUrl.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter') {
+    ev.preventDefault();
+    submitPickFromInput();
+  }
+});
+
+els.btnSubmitPick.addEventListener('click', () => {
+  submitPickFromInput();
+});
+
+els.btnUseTab.addEventListener('click', () => {
+  chrome.runtime.sendMessage({ type: 'get_wiki_tab_for_pick' }, (res) => {
+    if (chrome.runtime.lastError) {
+      els.error.hidden = false;
+      els.error.textContent = chrome.runtime.lastError.message || 'Could not read tabs';
+      return;
+    }
+    const tab = res?.tab;
+    if (!tab?.url || !/wikipedia\.org\/wiki\//i.test(tab.url)) {
+      els.error.hidden = false;
+      els.error.textContent = res?.error || 'Open a Wikipedia article tab first';
+      return;
+    }
+    const title = tab.title?.replace(/ - Wikipedia$/i, '') || '';
+    pickUrlDraft = title || tab.url;
+    pickUrlDirty = true;
+    els.pickUrl.value = pickUrlDraft;
+    submitPick(title, tab.url);
+  });
 });
 
 

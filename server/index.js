@@ -225,7 +225,11 @@ function publicPlayer(p) {
 function assignPickers(lobby) {
   const list = [...lobby.players.values()];
   const host = list.find((p) => p.isHost) || list[0];
-  const other = list.find((p) => p.id !== host?.id) || host;
+  // Prefer a connected non-host as target picker when one exists.
+  const other =
+    list.find((p) => p.id !== host?.id && p.connected) ||
+    list.find((p) => p.id !== host?.id) ||
+    host;
   lobby.startPickerId = host?.id || null;
   lobby.targetPickerId = other?.id || null;
 }
@@ -444,6 +448,17 @@ async function setPickPage(ws, msg) {
     return;
   }
   const role = msg.role === 'target' ? 'target' : 'start';
+  // Phase must match the role being submitted (keeps start→target→ready consistent).
+  if (lobby.pickPhase !== role) {
+    const phase = lobby.pickPhase || 'none';
+    send(ws, 'error', {
+      message:
+        phase === 'ready'
+          ? 'Both pages are already set'
+          : `Now picking ${phase} — send role "${phase}", not "${role}"`,
+    });
+    return;
+  }
   const allowedId = role === 'start' ? lobby.startPickerId : lobby.targetPickerId;
   if (playerId !== allowedId) {
     send(ws, 'error', { message: `Not your turn to pick the ${role} page` });
