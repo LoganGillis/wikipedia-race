@@ -11,9 +11,11 @@ This repo contains:
 
 - Create / join lobby with a short code
 - Host starts the race → server picks two distinct random articles via the MediaWiki API
-- Click counter: **+1** per article link navigation; **browser Back** undoes a click (never below 0)
+- Click counter: **+1** per article link navigation; **browser Back** undoes a click (never below 0), including bfcache restores
 - **Stopwatch** counting up from race start (not a countdown)
 - Extension popup shows live: lobby code, your name, connection status, start/target title+URL, clicks, stopwatch, player list / race status
+- **Live shared cursors** during a race (labeled pointers on the same Wikipedia page)
+- **Claimed links**: when you take an in-article link, others still on that page see it **red + crossed out** and cannot follow it; **Backing out releases the claim** so others can take it again
 
 ## Requirements
 

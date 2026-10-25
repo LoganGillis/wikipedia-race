@@ -4,17 +4,17 @@ const DEFAULT_SERVER = 'ws://localhost:3847/ws';
 
 /** @type {WebSocket|null} */
 let socket = null;
-/** @type {ReturnType<typeof setInterval>|null} */
+/** @type {ReturnType<typeof setTimeout>|null} */
 let reconnectTimer = null;
 let intentionalClose = false;
 
 const defaultState = () => ({
   serverUrl: DEFAULT_SERVER,
-  connectionStatus: 'disconnected', // disconnected | connecting | connected | error
+  connectionStatus: 'disconnected',
   lastError: null,
   playerId: null,
   playerName: '',
-  lobby: null, // full lobby snapshot from server
+  lobby: null,
 });
 
 async function loadState() {
@@ -26,17 +26,28 @@ async function saveState(partial) {
   const current = await loadState();
   const next = { ...current, ...partial };
   await chrome.storage.session.set({ raceState: next });
-  // Also mirror key fields to local for popup durability across SW restarts
   await chrome.storage.local.set({
     serverUrl: next.serverUrl,
     playerName: next.playerName,
   });
-  broadcastToPopup({ type: 'state', state: next });
+  broadcastToExtension({ type: 'state', state: next });
   return next;
 }
 
-function broadcastToPopup(msg) {
+function broadcastToExtension(msg) {
   chrome.runtime.sendMessage(msg).catch(() => {});
+  forwardToWikiTabs(msg);
+}
+
+async function forwardToWikiTabs(msg) {
+  try {
+    const tabs = await chrome.tabs.query({ url: ['https://*.wikipedia.org/*'] });
+    for (const tab of tabs) {
+      if (tab.id != null) {
+        chrome.tabs.sendMessage(tab.id, msg).catch(() => {});
+      }
+    }
+  } catch (_) {}
 }
 
 function toWsUrl(input) {
@@ -83,12 +94,8 @@ async function connect() {
 
   socket.addEventListener('close', async () => {
     socket = null;
-    if (!intentionalClose) {
-      await saveState({ connectionStatus: 'disconnected' });
-      scheduleReconnect();
-    } else {
-      await saveState({ connectionStatus: 'disconnected' });
-    }
+    await saveState({ connectionStatus: 'disconnected' });
+    if (!intentionalClose) scheduleReconnect();
   });
 
   socket.addEventListener('error', async () => {
@@ -127,6 +134,7 @@ async function handleServerMessage(msg) {
       break;
     case 'race_started':
       await saveState({ lobby: msg.lobby, lastError: null });
+      forwardToWikiTabs({ type: 'claims_reset' });
       if (msg.lobby?.startPage?.url) {
         openRaceTab(msg.lobby.startPage.url);
       }
@@ -134,6 +142,33 @@ async function handleServerMessage(msg) {
     case 'lobby_update':
     case 'race_preparing':
       if (msg.lobby) await saveState({ lobby: msg.lobby });
+      break;
+    case 'cursor_update':
+      forwardToWikiTabs({
+        type: 'remote_cursor',
+        playerId: msg.playerId,
+        playerName: msg.playerName,
+        x: msg.x,
+        y: msg.y,
+        pagePath: msg.pagePath,
+      });
+      break;
+    case 'cursor_leave':
+      forwardToWikiTabs({ type: 'cursor_leave', playerId: msg.playerId });
+      break;
+    case 'link_claimed':
+      await mergeClaim(msg.claim);
+      forwardToWikiTabs({ type: 'link_claimed', claim: msg.claim });
+      break;
+    case 'link_unclaimed':
+      await removeClaims(msg.claims || (msg.claim ? [msg.claim] : []), msg.sourcePath, msg.targetPath);
+      forwardToWikiTabs({
+        type: 'link_unclaimed',
+        claims: msg.claims,
+        claim: msg.claim,
+        sourcePath: msg.sourcePath,
+        targetPath: msg.targetPath,
+      });
       break;
     case 'error':
       await saveState({ lastError: msg.message || 'Server error' });
@@ -145,6 +180,33 @@ async function handleServerMessage(msg) {
   }
 }
 
+async function mergeClaim(claim) {
+  if (!claim) return;
+  const state = await loadState();
+  if (!state.lobby) return;
+  const claims = Array.isArray(state.lobby.claims) ? state.lobby.claims.slice() : [];
+  const exists = claims.some(
+    (c) => c.sourcePath === claim.sourcePath && c.targetPath === claim.targetPath
+  );
+  if (!exists) claims.push(claim);
+  await saveState({ lobby: { ...state.lobby, claims } });
+}
+
+async function removeClaims(list, sourcePath, targetPath) {
+  const state = await loadState();
+  if (!state.lobby) return;
+  let claims = Array.isArray(state.lobby.claims) ? state.lobby.claims.slice() : [];
+  if (Array.isArray(list) && list.length) {
+    const keys = new Set(list.map((c) => `${c.sourcePath}::${c.targetPath}`));
+    claims = claims.filter((c) => !keys.has(`${c.sourcePath}::${c.targetPath}`));
+  } else if (sourcePath && targetPath) {
+    claims = claims.filter(
+      (c) => !(c.sourcePath === sourcePath && c.targetPath === targetPath)
+    );
+  }
+  await saveState({ lobby: { ...state.lobby, claims } });
+}
+
 async function openRaceTab(url) {
   const tabs = await chrome.tabs.query({ url: ['https://*.wikipedia.org/*'] });
   if (tabs[0]?.id) {
@@ -152,6 +214,13 @@ async function openRaceTab(url) {
   } else {
     await chrome.tabs.create({ url, active: true });
   }
+}
+
+function sanitizeName(name) {
+  return String(name ?? '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .slice(0, 24);
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -171,13 +240,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       return;
     }
     if (msg.type === 'set_name') {
-      await saveState({ playerName: String(msg.name || '').slice(0, 24) });
-      sendResponse({ ok: true });
+      const playerName = sanitizeName(msg.name);
+      await saveState({ playerName });
+      sendResponse({ ok: true, playerName });
       return;
     }
     if (msg.type === 'create_lobby') {
       const state = await loadState();
-      const name = msg.name || state.playerName || 'Player';
+      const name = sanitizeName(msg.name) || state.playerName || 'Player';
       await saveState({ playerName: name });
       if (!(await ensureConnected())) {
         sendResponse({ ok: false, error: 'Not connected' });
@@ -189,7 +259,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     }
     if (msg.type === 'join_lobby') {
       const state = await loadState();
-      const name = msg.name || state.playerName || 'Player';
+      const name = sanitizeName(msg.name) || state.playerName || 'Player';
       await saveState({ playerName: name });
       if (!(await ensureConnected())) {
         sendResponse({ ok: false, error: 'Not connected' });
@@ -212,6 +282,32 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     }
     if (msg.type === 'wiki_nav') {
       await onWikiNav(msg);
+      sendResponse({ ok: true });
+      return;
+    }
+    if (msg.type === 'cursor_update') {
+      send('cursor_update', {
+        x: msg.x,
+        y: msg.y,
+        pagePath: msg.pagePath,
+      });
+      sendResponse({ ok: true });
+      return;
+    }
+    if (msg.type === 'link_claim') {
+      send('link_claim', {
+        sourcePath: msg.sourcePath,
+        targetPath: msg.targetPath,
+      });
+      sendResponse({ ok: true });
+      return;
+    }
+    if (msg.type === 'link_unclaim') {
+      send('link_unclaim', {
+        sourcePath: msg.sourcePath,
+        targetPath: msg.targetPath,
+        claims: msg.claims,
+      });
       sendResponse({ ok: true });
       return;
     }
@@ -239,12 +335,13 @@ async function onWikiNav(msg) {
   const me = state.lobby.players?.find((p) => p.id === state.playerId);
   let clicks = me?.clicks ?? 0;
 
-  if (msg.kind === 'link_click' || msg.kind === 'forward_nav') {
+  // Prefer absolute clicksHint from content script (nav stack) to avoid drift
+  if (typeof msg.clicksHint === 'number' && Number.isFinite(msg.clicksHint)) {
+    clicks = Math.max(0, Math.floor(msg.clicksHint));
+  } else if (msg.kind === 'link_click' || msg.kind === 'forward_nav') {
     clicks += 1;
   } else if (msg.kind === 'back') {
     clicks = Math.max(0, clicks - 1);
-  } else if (msg.kind === 'page_load' && typeof msg.clicksHint === 'number') {
-    clicks = Math.max(0, msg.clicksHint);
   }
 
   send('update_progress', {
@@ -254,7 +351,6 @@ async function onWikiNav(msg) {
   });
 }
 
-// Seed local prefs then connect
 chrome.storage.local.get(['serverUrl', 'playerName'], async (local) => {
   const patch = {};
   if (local.serverUrl) patch.serverUrl = local.serverUrl;

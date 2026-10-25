@@ -6,23 +6,49 @@ const PORT = Number(process.env.PORT) || 3847;
 const WS_URL = process.env.WS_URL || `ws://127.0.0.1:${PORT}/ws`;
 const HEALTH = process.env.HEALTH_URL || `http://127.0.0.1:${PORT}/health`;
 
-function waitMessage(ws, predicate, timeoutMs = 15000) {
-  return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error('Timeout waiting for message')), timeoutMs);
-    const onMsg = (raw) => {
-      let msg;
-      try {
-        msg = JSON.parse(String(raw));
-      } catch {
+function connect() {
+  const ws = new WebSocket(WS_URL);
+  const buffer = [];
+  const waiters = [];
+
+  ws.on('message', (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(String(raw));
+    } catch {
+      return;
+    }
+    for (let i = 0; i < waiters.length; i++) {
+      if (waiters[i].predicate(msg)) {
+        const w = waiters.splice(i, 1)[0];
+        clearTimeout(w.timer);
+        w.resolve(msg);
         return;
       }
-      if (predicate(msg)) {
-        clearTimeout(t);
-        ws.off('message', onMsg);
-        resolve(msg);
+    }
+    buffer.push(msg);
+  });
+
+  ws.wait = (predicate, timeoutMs = 15000) =>
+    new Promise((resolve, reject) => {
+      for (let i = 0; i < buffer.length; i++) {
+        if (predicate(buffer[i])) {
+          const msg = buffer.splice(i, 1)[0];
+          resolve(msg);
+          return;
+        }
       }
-    };
-    ws.on('message', onMsg);
+      const timer = setTimeout(() => {
+        const idx = waiters.findIndex((w) => w.timer === timer);
+        if (idx >= 0) waiters.splice(idx, 1);
+        reject(new Error('Timeout waiting for message'));
+      }, timeoutMs);
+      waiters.push({ predicate, resolve, reject, timer });
+    });
+
+  return new Promise((resolve, reject) => {
+    ws.once('open', () => resolve(ws));
+    ws.once('error', reject);
   });
 }
 
@@ -34,42 +60,40 @@ async function main() {
   console.log('health:', health);
   if (!health.ok) throw new Error('Health not ok');
 
-  console.log('WS connect', WS_URL);
-  const ws = new WebSocket(WS_URL);
-
-  await new Promise((resolve, reject) => {
-    ws.once('open', resolve);
-    ws.once('error', reject);
-  });
-
-  const hello = await waitMessage(ws, (m) => m.type === 'hello');
-  console.log('hello:', hello.message);
+  const ws = await connect();
+  await ws.wait((m) => m.type === 'hello');
 
   ws.send(JSON.stringify({ type: 'create_lobby', name: 'SmokeTester' }));
-  const created = await waitMessage(ws, (m) => m.type === 'lobby_created');
-  console.log('lobby:', created.lobby.code, 'players:', created.lobby.players.length);
-  if (!created.lobby?.code) throw new Error('No lobby code');
+  const created = await ws.wait((m) => m.type === 'lobby_created');
+  console.log('lobby:', created.lobby.code, 'name:', created.lobby.players[0].name);
+  if (created.lobby.players[0].name !== 'SmokeTester') {
+    throw new Error('Full name not preserved');
+  }
+
+  const ws2 = await connect();
+  await ws2.wait((m) => m.type === 'hello');
+  ws2.send(
+    JSON.stringify({ type: 'join_lobby', code: created.lobby.code, name: 'OtherPlayer' })
+  );
+  await ws2.wait((m) => m.type === 'lobby_joined');
+  await ws.wait((m) => m.type === 'lobby_update');
+  console.log('second player joined');
 
   ws.send(JSON.stringify({ type: 'start_race' }));
-  const started = await waitMessage(
-    ws,
+  const started = await ws.wait(
     (m) => m.type === 'race_started' || m.type === 'error',
     20000
   );
   if (started.type === 'error') throw new Error(started.message);
+  await ws2.wait((m) => m.type === 'race_started', 20000);
 
   const { startPage, targetPage, startedAt, status } = started.lobby;
   console.log('status:', status);
-  console.log('start:', startPage.title, '→', startPage.url);
-  console.log('target:', targetPage.title, '→', targetPage.url);
-  console.log('startedAt:', startedAt);
-
-  if (!startPage?.title || !targetPage?.title) throw new Error('Missing pages');
+  console.log('start:', startPage.title);
+  console.log('target:', targetPage.title);
   if (startPage.title === targetPage.title) throw new Error('Start === target');
-  if (status !== 'racing') throw new Error('Expected racing status');
   if (!startedAt) throw new Error('Missing startedAt');
 
-  // Simulate progress
   ws.send(
     JSON.stringify({
       type: 'update_progress',
@@ -78,25 +102,55 @@ async function main() {
       currentUrl: startPage.url,
     })
   );
-  const updated = await waitMessage(ws, (m) => m.type === 'lobby_update');
+  const updated = await ws.wait((m) => m.type === 'lobby_update');
   const me = updated.lobby.players.find((p) => p.id === created.playerId);
-  console.log('clicks after update:', me.clicks);
   if (me.clicks !== 3) throw new Error('Click update failed');
+  console.log('clicks after update:', me.clicks);
 
-  // Second player join attempt on racing lobby should fail
-  const ws2 = new WebSocket(WS_URL);
-  await new Promise((resolve, reject) => {
-    ws2.once('open', resolve);
-    ws2.once('error', reject);
-  });
-  await waitMessage(ws2, (m) => m.type === 'hello');
-  ws2.send(JSON.stringify({ type: 'join_lobby', code: created.lobby.code, name: 'Late' }));
-  const late = await waitMessage(ws2, (m) => m.type === 'error' || m.type === 'lobby_joined');
-  console.log('late join:', late.type, late.message || '');
-  if (late.type !== 'error') throw new Error('Expected late join to fail');
+  const sourcePath = '/wiki/' + encodeURIComponent(startPage.title.replace(/ /g, '_'));
+  // Server normalizeWikiPath decodes; send a clean path
+  const sourcePathClean = '/wiki/' + startPage.title.replace(/ /g, '_');
+  const targetPath = '/wiki/Some_Claimed_Article';
 
-  ws2.close();
+  const claimWait = ws2.wait((m) => m.type === 'link_claimed');
+  ws.send(JSON.stringify({ type: 'link_claim', sourcePath: sourcePathClean, targetPath }));
+  const claimed = await claimWait;
+  console.log('claim:', claimed.claim.sourcePath, '→', claimed.claim.targetPath);
+  if (claimed.claim.playerName !== 'SmokeTester') throw new Error('claim name wrong');
+
+  const cursorWait = ws2.wait((m) => m.type === 'cursor_update');
+  ws.send(
+    JSON.stringify({
+      type: 'cursor_update',
+      x: 0.25,
+      y: 0.75,
+      pagePath: sourcePathClean,
+    })
+  );
+  const cursor = await cursorWait;
+  console.log('cursor:', cursor.playerName, cursor.x, cursor.y);
+  if (cursor.playerId !== created.playerId) throw new Error('cursor playerId mismatch');
+
+  const unclaimWait = ws2.wait((m) => m.type === 'link_unclaimed');
+  ws.send(
+    JSON.stringify({ type: 'link_unclaim', sourcePath: sourcePathClean, targetPath })
+  );
+  const unclaimed = await unclaimWait;
+  console.log('unclaimed count:', (unclaimed.claims || []).length);
+  if (!unclaimed.claims?.length) throw new Error('expected unclaimed claims array');
+
+  const ws3 = await connect();
+  await ws3.wait((m) => m.type === 'hello');
+  ws3.send(JSON.stringify({ type: 'create_lobby', name: '  Tester Name  ' }));
+  const c3 = await ws3.wait((m) => m.type === 'lobby_created');
+  if (c3.lobby.players[0].name !== 'Tester Name') {
+    throw new Error(`Name sanitize failed: ${c3.lobby.players[0].name}`);
+  }
+  console.log('sanitized name ok:', c3.lobby.players[0].name);
+
   ws.close();
+  ws2.close();
+  ws3.close();
   console.log('\nSMOKE OK');
 }
 

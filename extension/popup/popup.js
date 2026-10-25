@@ -28,6 +28,12 @@ const els = {
 
 let latestState = null;
 let stopwatchTimer = null;
+/** Draft name captured on every input — survives blur/re-render races on Create/Join. */
+let nameDraft = '';
+let nameDirty = false;
+let serverUrlDraft = '';
+let serverUrlDirty = false;
+let hydrated = false;
 
 function setConnectionBadge(status) {
   els.connection.textContent = ({
@@ -60,15 +66,34 @@ function tickStopwatch() {
   els.stopwatch.textContent = formatStopwatch(end - lobby.startedAt);
 }
 
+function readPlayerName() {
+  const fromInput = String(els.playerName.value || '').trim();
+  const fromDraft = String(nameDraft || '').trim();
+  // Prefer whichever is longer / current — draft wins ties when dirty
+  if (nameDirty && fromDraft) return fromDraft;
+  return fromInput || fromDraft;
+}
+
 function render(state) {
   latestState = state;
   setConnectionBadge(state.connectionStatus || 'disconnected');
 
-  if (document.activeElement !== els.serverUrl) {
-    els.serverUrl.value = state.serverUrl || '';
-  }
-  if (document.activeElement !== els.playerName) {
-    els.playerName.value = state.playerName || '';
+  if (!hydrated) {
+    serverUrlDraft = state.serverUrl || '';
+    els.serverUrl.value = serverUrlDraft;
+    nameDraft = state.playerName || '';
+    els.playerName.value = nameDraft;
+    hydrated = true;
+  } else {
+    // Never clobber in-progress typing. Only sync from state when field is clean.
+    if (!serverUrlDirty && document.activeElement !== els.serverUrl) {
+      els.serverUrl.value = state.serverUrl || '';
+    }
+    if (!nameDirty && document.activeElement !== els.playerName) {
+      // Keep showing what the user typed (nameDraft) if present; else state
+      const show = nameDraft || state.playerName || '';
+      if (els.playerName.value !== show) els.playerName.value = show;
+    }
   }
 
   if (state.lastError) {
@@ -93,14 +118,15 @@ function render(state) {
   els.setup.hidden = true;
   els.lobbyPanel.hidden = false;
   els.lobbyCode.textContent = lobby.code;
-  els.youName.textContent = state.playerName || '—';
+
+  const me = lobby.players?.find((p) => p.id === state.playerId);
+  els.youName.textContent = me?.name || state.playerName || nameDraft || '—';
   els.raceStatus.textContent = ({
     waiting: 'Waiting in lobby',
     racing: 'Racing',
     finished: 'Finished',
   })[lobby.status] || lobby.status;
 
-  const me = lobby.players?.find((p) => p.id === state.playerId);
   const isHost = Boolean(me?.isHost);
   els.btnStart.hidden = !(isHost && lobby.status === 'waiting');
 
@@ -166,30 +192,62 @@ function refresh() {
   });
 }
 
+els.playerName.addEventListener('input', () => {
+  nameDraft = els.playerName.value;
+  nameDirty = true;
+});
+
+els.serverUrl.addEventListener('input', () => {
+  serverUrlDraft = els.serverUrl.value;
+  serverUrlDirty = true;
+});
+
+// Capture name on pointerdown BEFORE blur+render can wipe the input value
+function armNameCapture(btn) {
+  btn.addEventListener('pointerdown', () => {
+    nameDraft = els.playerName.value || nameDraft;
+    nameDirty = true;
+  });
+}
+armNameCapture(els.btnCreate);
+armNameCapture(els.btnJoin);
+armNameCapture(els.btnConnect);
+
 els.btnConnect.addEventListener('click', () => {
-  chrome.runtime.sendMessage(
-    { type: 'set_server_url', serverUrl: els.serverUrl.value },
-    () => {
-      chrome.runtime.sendMessage({ type: 'set_name', name: els.playerName.value }, refresh);
-    }
-  );
+  const name = readPlayerName();
+  nameDraft = name;
+  const url = els.serverUrl.value || serverUrlDraft;
+  serverUrlDirty = false;
+  chrome.runtime.sendMessage({ type: 'set_server_url', serverUrl: url }, () => {
+    chrome.runtime.sendMessage({ type: 'set_name', name }, () => {
+      nameDirty = false;
+      refresh();
+    });
+  });
 });
 
 els.btnCreate.addEventListener('click', () => {
-  chrome.runtime.sendMessage(
-    { type: 'create_lobby', name: els.playerName.value },
-    refresh
-  );
+  const name = readPlayerName();
+  nameDraft = name;
+  chrome.runtime.sendMessage({ type: 'create_lobby', name }, () => {
+    nameDirty = false;
+    refresh();
+  });
 });
 
 els.btnJoin.addEventListener('click', () => {
+  const name = readPlayerName();
+  nameDraft = name;
   chrome.runtime.sendMessage(
     {
       type: 'join_lobby',
       code: els.joinCode.value.trim().toUpperCase(),
-      name: els.playerName.value,
+      name,
     },
-    refresh
+    () => {
+      nameDirty = false;
+      refresh();
+    }
   );
 });
 
