@@ -9,7 +9,7 @@
     "http://localhost/*",
     "http://127.0.0.1/*",
     "http://51.81.33.210/*",
-    "http://51.81.33.210:3847/*"
+    "http://51.81.33.210:3848/*"
   ],
   "background": {
     "service_worker": "background/service-worker.js",
