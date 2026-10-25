@@ -6,6 +6,7 @@ const els = {
   connection: $('connection'),
   serverUrl: $('serverUrl'),
   playerName: $('playerName'),
+  createMode: $('createMode'),
   btnConnect: $('btnConnect'),
   btnCreate: $('btnCreate'),
   btnJoin: $('btnJoin'),
@@ -15,7 +16,18 @@ const els = {
   lobbyPanel: $('lobbyPanel'),
   lobbyCode: $('lobbyCode'),
   youName: $('youName'),
+  modeLabel: $('modeLabel'),
   raceStatus: $('raceStatus'),
+  modeControls: $('modeControls'),
+  modeHint: $('modeHint'),
+  hostModeRow: $('hostModeRow'),
+  pickActions: $('pickActions'),
+  pickUrl: $('pickUrl'),
+  btnUseTab: $('btnUseTab'),
+  btnSubmitPick: $('btnSubmitPick'),
+  btnModeClassic: $('btnModeClassic'),
+  btnModePick: $('btnModePick'),
+  winnerBanner: $('winnerBanner'),
   raceMeta: $('raceMeta'),
   startPage: $('startPage'),
   targetPage: $('targetPage'),
@@ -28,7 +40,6 @@ const els = {
 
 let latestState = null;
 let stopwatchTimer = null;
-/** Draft name captured on every input — survives blur/re-render races on Create/Join. */
 let nameDraft = '';
 let nameDirty = false;
 let serverUrlDraft = '';
@@ -69,9 +80,12 @@ function tickStopwatch() {
 function readPlayerName() {
   const fromInput = String(els.playerName.value || '').trim();
   const fromDraft = String(nameDraft || '').trim();
-  // Prefer whichever is longer / current — draft wins ties when dirty
   if (nameDirty && fromDraft) return fromDraft;
   return fromInput || fromDraft;
+}
+
+function playerNameById(lobby, id) {
+  return lobby.players?.find((p) => p.id === id)?.name || 'Player';
 }
 
 function render(state) {
@@ -85,12 +99,10 @@ function render(state) {
     els.playerName.value = nameDraft;
     hydrated = true;
   } else {
-    // Never clobber in-progress typing. Only sync from state when field is clean.
     if (!serverUrlDirty && document.activeElement !== els.serverUrl) {
       els.serverUrl.value = state.serverUrl || '';
     }
     if (!nameDirty && document.activeElement !== els.playerName) {
-      // Keep showing what the user typed (nameDraft) if present; else state
       const show = nameDraft || state.playerName || '';
       if (els.playerName.value !== show) els.playerName.value = show;
     }
@@ -121,27 +133,95 @@ function render(state) {
 
   const me = lobby.players?.find((p) => p.id === state.playerId);
   els.youName.textContent = me?.name || state.playerName || nameDraft || '—';
-  els.raceStatus.textContent = ({
-    waiting: 'Waiting in lobby',
-    racing: 'Racing',
-    finished: 'Finished',
-  })[lobby.status] || lobby.status;
+  els.modeLabel.textContent = lobby.mode === 'pick' ? 'Pick' : 'Classic';
 
   const isHost = Boolean(me?.isHost);
-  els.btnStart.hidden = !(isHost && lobby.status === 'waiting');
-
+  const waiting = lobby.status === 'waiting';
   const racing = lobby.status === 'racing' || lobby.status === 'finished';
-  els.raceMeta.hidden = !racing;
 
-  if (racing && lobby.startPage) {
+  if (lobby.status === 'waiting' && lobby.mode === 'pick') {
+    const phase = lobby.pickPhase || 'start';
+    if (phase === 'start') {
+      els.raceStatus.textContent = `${playerNameById(lobby, lobby.startPickerId)} picks START`;
+    } else if (phase === 'target') {
+      els.raceStatus.textContent = `${playerNameById(lobby, lobby.targetPickerId)} picks TARGET`;
+    } else {
+      els.raceStatus.textContent = 'Pages set — host can start';
+    }
+  } else {
+    els.raceStatus.textContent = ({
+      waiting: 'Waiting in lobby',
+      racing: 'Racing',
+      finished: 'Finished',
+    })[lobby.status] || lobby.status;
+  }
+
+  // Mode controls while waiting
+  els.modeControls.hidden = !waiting;
+  if (waiting) {
+    els.hostModeRow.hidden = !isHost;
+    els.btnModeClassic.classList.toggle('active', lobby.mode !== 'pick');
+    els.btnModePick.classList.toggle('active', lobby.mode === 'pick');
+
+    if (lobby.mode === 'pick') {
+      const phase = lobby.pickPhase || 'start';
+      const myTurn =
+        (phase === 'start' && state.playerId === lobby.startPickerId) ||
+        (phase === 'target' && state.playerId === lobby.targetPickerId);
+      els.pickActions.hidden = !myTurn;
+      if (phase === 'start') {
+        els.modeHint.textContent = myTurn
+          ? 'Your turn: set the START article (open it on Wikipedia, then Use current tab).'
+          : `Waiting for ${playerNameById(lobby, lobby.startPickerId)} to set START.`;
+      } else if (phase === 'target') {
+        els.modeHint.textContent = myTurn
+          ? 'Your turn: set the TARGET article.'
+          : `Waiting for ${playerNameById(lobby, lobby.targetPickerId)} to set TARGET.`;
+      } else {
+        els.pickActions.hidden = true;
+        els.modeHint.textContent = `Start: ${lobby.startPage?.title || '—'} → Target: ${lobby.targetPage?.title || '—'}`;
+      }
+    } else {
+      els.pickActions.hidden = true;
+      els.modeHint.textContent = 'Classic: host starts to get random start & target pages.';
+    }
+  }
+
+  // Winner banner
+  const winners = (lobby.players || []).filter((p) => p.finished).sort((a, b) => (a.finishedAt || 0) - (b.finishedAt || 0));
+  if (winners.length) {
+    const w = winners[0];
+    const time = lobby.startedAt && w.finishedAt ? formatStopwatch(w.finishedAt - lobby.startedAt) : '—';
+    els.winnerBanner.hidden = false;
+    els.winnerBanner.textContent = `🏆 ${w.name} wins! ${w.clicks} clicks · ${time}`;
+  } else {
+    els.winnerBanner.hidden = true;
+    els.winnerBanner.textContent = '';
+  }
+
+  // Start button
+  if (isHost && waiting) {
+    if (lobby.mode === 'pick') {
+      els.btnStart.hidden = !(lobby.startPage && lobby.targetPage);
+      els.btnStart.textContent = 'Start race';
+    } else {
+      els.btnStart.hidden = false;
+      els.btnStart.textContent = 'Start race';
+    }
+  } else {
+    els.btnStart.hidden = true;
+  }
+
+  els.raceMeta.hidden = !racing && !(waiting && (lobby.startPage || lobby.targetPage));
+
+  if (lobby.startPage) {
     els.startPage.textContent = lobby.startPage.title;
     els.startPage.href = lobby.startPage.url;
   } else {
     els.startPage.textContent = '—';
     els.startPage.removeAttribute('href');
   }
-
-  if (racing && lobby.targetPage) {
+  if (lobby.targetPage) {
     els.targetPage.textContent = lobby.targetPage.title;
     els.targetPage.href = lobby.targetPage.url;
   } else {
@@ -162,11 +242,19 @@ function render(state) {
     if (p.finished) li.classList.add('done');
     if (!p.connected) li.classList.add('offline');
 
+    let role = '';
+    if (lobby.mode === 'pick' && waiting) {
+      if (p.id === lobby.startPickerId) role += ' · start picker';
+      if (p.id === lobby.targetPickerId) role += ' · target picker';
+    }
+
     const name = document.createElement('span');
     name.textContent =
       p.name +
       (p.isHost ? ' (host)' : '') +
       (p.id === state.playerId ? ' · you' : '') +
+      role +
+      (p.finished ? ' 🏆' : '') +
       (!p.connected ? ' · offline' : '');
 
     const meta = document.createElement('span');
@@ -196,13 +284,11 @@ els.playerName.addEventListener('input', () => {
   nameDraft = els.playerName.value;
   nameDirty = true;
 });
-
 els.serverUrl.addEventListener('input', () => {
   serverUrlDraft = els.serverUrl.value;
   serverUrlDirty = true;
 });
 
-// Capture name on pointerdown BEFORE blur+render can wipe the input value
 function armNameCapture(btn) {
   btn.addEventListener('pointerdown', () => {
     nameDraft = els.playerName.value || nameDraft;
@@ -229,10 +315,13 @@ els.btnConnect.addEventListener('click', () => {
 els.btnCreate.addEventListener('click', () => {
   const name = readPlayerName();
   nameDraft = name;
-  chrome.runtime.sendMessage({ type: 'create_lobby', name }, () => {
-    nameDirty = false;
-    refresh();
-  });
+  chrome.runtime.sendMessage(
+    { type: 'create_lobby', name, mode: els.createMode.value },
+    () => {
+      nameDirty = false;
+      refresh();
+    }
+  );
 });
 
 els.btnJoin.addEventListener('click', () => {
@@ -257,6 +346,38 @@ els.btnStart.addEventListener('click', () => {
 
 els.btnLeave.addEventListener('click', () => {
   chrome.runtime.sendMessage({ type: 'leave_lobby' }, refresh);
+});
+
+els.btnModeClassic.addEventListener('click', () => {
+  chrome.runtime.sendMessage({ type: 'set_mode', mode: 'classic' }, refresh);
+});
+els.btnModePick.addEventListener('click', () => {
+  chrome.runtime.sendMessage({ type: 'set_mode', mode: 'pick' }, refresh);
+});
+
+function submitPick(title, url) {
+  const lobby = latestState?.lobby;
+  if (!lobby || lobby.mode !== 'pick') return;
+  const role = lobby.pickPhase === 'target' ? 'target' : 'start';
+  chrome.runtime.sendMessage({ type: 'set_pick_page', role, title, url }, refresh);
+}
+
+els.btnSubmitPick.addEventListener('click', () => {
+  const raw = els.pickUrl.value.trim();
+  if (!raw) return;
+  if (/^https?:\/\//i.test(raw)) submitPick('', raw);
+  else submitPick(raw, '');
+});
+
+els.btnUseTab.addEventListener('click', async () => {
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  const tab = tabs[0];
+  if (!tab?.url || !/wikipedia\.org\/wiki\//i.test(tab.url)) {
+    els.error.hidden = false;
+    els.error.textContent = 'Open a Wikipedia article tab first';
+    return;
+  }
+  submitPick(tab.title?.replace(/ - Wikipedia$/i, '') || '', tab.url);
 });
 
 chrome.runtime.onMessage.addListener((msg) => {

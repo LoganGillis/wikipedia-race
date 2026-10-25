@@ -25,12 +25,13 @@ const CURSOR_COLORS = [
   '#3d8bfd', '#3dd68c', '#f5a524', '#f31260', '#a78bfa', '#22d3ee', '#fb7185',
 ];
 
-/** @type {{ playerId: string|null, playerName: string, racing: boolean, claims: any[] }} */
+/** @type {{ playerId: string|null, playerName: string, racing: boolean, claims: any[], lobby: any|null }} */
 let raceCtx = {
   playerId: null,
   playerName: '',
   racing: false,
   claims: [],
+  lobby: null,
 };
 
 /** @type {Map<string, HTMLElement>} */
@@ -42,16 +43,33 @@ let lastCursorSent = 0;
 let claimsStyleEl = null;
 let bootstrapped = false;
 
-function articlePathFromUrl(href) {
+function canonicalWikiPath(input) {
+  if (!input) return null;
+  let p = String(input).trim();
   try {
-    const u = new URL(href, location.href);
-    if (!u.pathname.startsWith('/wiki/')) return null;
-    const rest = decodeURIComponent(u.pathname.slice('/wiki/'.length));
-    if (!rest || rest.includes(':')) return null;
-    return '/wiki/' + rest;
+    if (p.startsWith('http://') || p.startsWith('https://')) p = new URL(p).pathname;
   } catch {
     return null;
   }
+  if (!p.startsWith('/wiki/')) return null;
+  p = p.split('?')[0].split('#')[0];
+  let rest = p.slice('/wiki/'.length);
+  try {
+    rest = decodeURIComponent(rest);
+  } catch (_) {}
+  rest = rest.replace(/ /g, '_');
+  if (!rest || rest.includes(':')) return null;
+  return '/wiki/' + rest;
+}
+
+function pathsEqual(a, b) {
+  const ca = canonicalWikiPath(a);
+  const cb = canonicalWikiPath(b);
+  return Boolean(ca && cb && ca === cb);
+}
+
+function articlePathFromUrl(href) {
+  return canonicalWikiPath(href);
 }
 
 function currentArticlePath() {
@@ -326,7 +344,9 @@ document.addEventListener(
     const fromPath = currentArticlePath();
     if (!targetPath || !fromPath) return;
 
-    if (raceCtx.racing && isClaimedByOther(fromPath, targetPath)) {
+    const inRace = raceCtx.racing || sessionStorage.getItem('__wr_racing') === '1';
+    if (inRace) raceCtx.racing = true;
+    if (inRace && isClaimedByOther(fromPath, targetPath)) {
       ev.preventDefault();
       ev.stopPropagation();
       flashClaimed(a);
@@ -335,20 +355,33 @@ document.addEventListener(
 
     savePending({ targetPath, fromPath });
 
-    if (raceCtx.racing) {
+    if (inRace) {
       const stack = loadStack();
       const idx = loadIndex();
       const curClicks = idx >= 0 && stack[idx] ? stack[idx].clicks : 0;
       const edges = loadClaimEdges();
       edges.length = curClicks;
-      edges.push({ sourcePath: fromPath, targetPath });
+      const src = canonicalWikiPath(fromPath) || fromPath;
+      const dst = canonicalWikiPath(targetPath) || targetPath;
+      edges.push({ sourcePath: src, targetPath: dst });
       saveClaimEdges(edges);
+
+      // Optimistic local claim so others' styling applies after broadcast;
+      // also mark for self visibility
+      if (!raceCtx.claims.some((c) => pathsEqual(c.sourcePath, src) && pathsEqual(c.targetPath, dst))) {
+        raceCtx.claims.push({
+          sourcePath: src,
+          targetPath: dst,
+          playerId: raceCtx.playerId || 'local',
+          playerName: raceCtx.playerName || 'You',
+        });
+      }
 
       chrome.runtime
         .sendMessage({
           type: 'link_claim',
-          sourcePath: fromPath,
-          targetPath,
+          sourcePath: src,
+          targetPath: dst,
         })
         .catch(() => {});
     }
@@ -379,24 +412,36 @@ function syncRaceContext() {
 }
 
 function applyState(state) {
-  const lobby = state.lobby;
+  const lobby = state.lobby || null;
   raceCtx.playerId = state.playerId || null;
   raceCtx.playerName = state.playerName || '';
+  raceCtx.lobby = lobby;
   raceCtx.racing = lobby?.status === 'racing';
-  if (Array.isArray(lobby?.claims)) raceCtx.claims = lobby.claims;
-  // Do not reset nav stack here — that would wipe mid-race on script reinject.
-  // Race start uses claims_reset + session seed (see service worker).
-  if (!raceCtx.racing) {
+  try {
+    if (raceCtx.racing) sessionStorage.setItem('__wr_racing', '1');
+    else if (lobby?.status !== 'finished') sessionStorage.removeItem('__wr_racing');
+  } catch (_) {}
+  if (Array.isArray(lobby?.claims)) {
+    raceCtx.claims = lobby.claims.map((c) => ({
+      ...c,
+      sourcePath: canonicalWikiPath(c.sourcePath) || c.sourcePath,
+      targetPath: canonicalWikiPath(c.targetPath) || c.targetPath,
+    }));
+  }
+  if (!raceCtx.racing && lobby?.status !== 'finished') {
     clearCursors();
   }
   refreshClaimsUi();
+  renderHud();
+  renderVictory();
+  maybeAnnounceTargetReached();
 }
 
 function isClaimedByOther(sourcePath, targetPath) {
   return raceCtx.claims.some(
     (c) =>
-      c.sourcePath === sourcePath &&
-      c.targetPath === targetPath &&
+      pathsEqual(c.sourcePath, sourcePath) &&
+      pathsEqual(c.targetPath, targetPath) &&
       c.playerId !== raceCtx.playerId
   );
 }
@@ -420,18 +465,29 @@ function refreshClaimsUi() {
   });
   if (!raceCtx.racing || !sourcePath) return;
 
-  const claimedHere = raceCtx.claims.filter((c) => c.sourcePath === sourcePath);
+  const claimedHere = raceCtx.claims.filter((c) => pathsEqual(c.sourcePath, sourcePath));
   if (!claimedHere.length) return;
 
   const byTarget = new Map();
-  for (const c of claimedHere) byTarget.set(c.targetPath, c);
+  for (const c of claimedHere) {
+    const key = canonicalWikiPath(c.targetPath) || c.targetPath;
+    byTarget.set(key, c);
+  }
+
+  const byTargetCanon = new Map();
+  for (const [tp, claim] of byTarget) {
+    const c = canonicalWikiPath(tp) || tp;
+    byTargetCanon.set(c, claim);
+  }
 
   document
-    .querySelectorAll('#content a[href], #bodyContent a[href], #mw-content-text a[href]')
+    .querySelectorAll(
+      '#content a[href], #bodyContent a[href], #mw-content-text a[href], main a[href], .mw-parser-output a[href]'
+    )
     .forEach((a) => {
       const tp = articlePathFromUrl(a.href);
-      if (!tp || !byTarget.has(tp)) return;
-      const claim = byTarget.get(tp);
+      if (!tp || !byTargetCanon.has(tp)) return;
+      const claim = byTargetCanon.get(tp);
       a.classList.add('wr-claimed-link');
       if (a.dataset.wrTitleOrig == null) {
         a.dataset.wrTitleOrig = a.title || '';
@@ -508,8 +564,8 @@ function colorForId(id) {
 }
 
 function upsertCursor(playerId, playerName, pageX, pageY) {
-  if (!raceCtx.racing) return;
-  if (playerId && playerId === raceCtx.playerId) return;
+  if (!raceCtx.racing && sessionStorage.getItem('__wr_racing') !== '1') return;
+  if (playerId && raceCtx.playerId && playerId === raceCtx.playerId) return;
   cursorPositions.set(playerId, {
     name: playerName || 'Player',
     pageX: Number(pageX) || 0,
@@ -577,17 +633,19 @@ function clearCursors() {
 document.addEventListener(
   'mousemove',
   (ev) => {
-    if (!raceCtx.racing) return;
+    if (!raceCtx.racing && sessionStorage.getItem('__wr_racing') !== '1') return;
+    raceCtx.racing = true;
     const now = performance.now();
     if (now - lastCursorSent < 50) return; // ~20 Hz
     lastCursorSent = now;
+    const pagePath = currentArticlePath();
     chrome.runtime
       .sendMessage({
         type: 'cursor_update',
         // Document/page space so scroll doesn't desync remote cursors
         x: ev.pageX,
         y: ev.pageY,
-        pagePath: currentArticlePath(),
+        pagePath,
       })
       .catch(() => {});
   },
@@ -603,9 +661,10 @@ chrome.runtime.onMessage.addListener((msg) => {
     return;
   }
   if (msg.type === 'remote_cursor') {
-    if (!raceCtx.racing) return;
+    if (!raceCtx.racing && sessionStorage.getItem('__wr_racing') !== '1') return;
+    raceCtx.racing = true;
     const myPath = currentArticlePath();
-    if (msg.pagePath && myPath && msg.pagePath !== myPath) {
+    if (msg.pagePath && myPath && !pathsEqual(msg.pagePath, myPath)) {
       removeCursor(msg.playerId);
       return;
     }
@@ -617,11 +676,21 @@ chrome.runtime.onMessage.addListener((msg) => {
     return;
   }
   if (msg.type === 'link_claimed' && msg.claim) {
-    const c = msg.claim;
+    const c = {
+      ...msg.claim,
+      sourcePath: canonicalWikiPath(msg.claim.sourcePath) || msg.claim.sourcePath,
+      targetPath: canonicalWikiPath(msg.claim.targetPath) || msg.claim.targetPath,
+    };
     const exists = raceCtx.claims.some(
-      (x) => x.sourcePath === c.sourcePath && x.targetPath === c.targetPath
+      (x) => pathsEqual(x.sourcePath, c.sourcePath) && pathsEqual(x.targetPath, c.targetPath)
     );
     if (!exists) raceCtx.claims.push(c);
+    else {
+      // update name/id
+      raceCtx.claims = raceCtx.claims.map((x) =>
+        pathsEqual(x.sourcePath, c.sourcePath) && pathsEqual(x.targetPath, c.targetPath) ? c : x
+      );
+    }
     refreshClaimsUi();
     return;
   }
@@ -644,6 +713,10 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
   if (msg.type === 'claims_reset') {
     raceCtx.claims = [];
+    raceCtx.racing = true;
+    try {
+      sessionStorage.setItem('__wr_racing', '1');
+    } catch (_) {}
     resetNavForNewRace();
     refreshClaimsUi();
     clearCursors();
@@ -656,3 +729,225 @@ const mo = new MutationObserver(() => {
   if (raceCtx.racing) refreshClaimsUi();
 });
 mo.observe(document.documentElement, { childList: true, subtree: true });
+
+
+/* ─── Side HUD + victory banner ─── */
+
+let hudRoot = null;
+let hudCollapsed = false;
+let hudTimer = null;
+let victoryShownFor = null;
+
+function formatSw(ms) {
+  if (ms == null || ms < 0) return '00:00.0';
+  const totalTenths = Math.floor(ms / 100);
+  const tenths = totalTenths % 10;
+  const totalSeconds = Math.floor(totalTenths / 10);
+  const s = totalSeconds % 60;
+  const m = Math.floor(totalSeconds / 60);
+  return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0') + '.' + tenths;
+}
+
+function ensureHud() {
+  ensureClaimsStyle();
+  if (!document.getElementById('wr-hud-style')) {
+    const st = document.createElement('style');
+    st.id = 'wr-hud-style';
+    st.textContent = `
+      #wr-hud {
+        position: fixed; top: 72px; right: 12px; z-index: 2147483645;
+        width: 260px; max-height: calc(100vh - 96px); overflow: auto;
+        background: rgba(15,20,25,0.94); color: #e7ecf3;
+        border: 1px solid #2d3a4d; border-radius: 12px;
+        font: 12px/1.4 system-ui, sans-serif;
+        box-shadow: 0 8px 28px rgba(0,0,0,.35);
+        pointer-events: auto;
+      }
+      #wr-hud.collapsed { width: auto; }
+      #wr-hud.collapsed .wr-hud-body { display: none; }
+      #wr-hud header {
+        display: flex; align-items: center; justify-content: space-between;
+        gap: 8px; padding: 8px 10px; cursor: pointer;
+        border-bottom: 1px solid #2d3a4d; font-weight: 700;
+      }
+      #wr-hud .wr-hud-body { padding: 10px; }
+      #wr-hud .row { display: flex; justify-content: space-between; gap: 8px; margin: 4px 0; }
+      #wr-hud .muted { color: #8b9bb4; }
+      #wr-hud .big { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
+      #wr-hud ul { list-style: none; margin: 6px 0 0; padding: 0; }
+      #wr-hud li {
+        display: flex; justify-content: space-between; gap: 6px;
+        padding: 4px 6px; margin-bottom: 3px; border-radius: 6px; background: #121a26;
+      }
+      #wr-hud li.you { outline: 1px solid #3d8bfd; }
+      #wr-hud li.done { color: #3dd68c; }
+      #wr-hud .hint { margin-top: 8px; font-size: 11px; color: #8b9bb4; }
+      #wr-victory {
+        position: fixed; inset: 0; z-index: 2147483647;
+        display: flex; align-items: center; justify-content: center;
+        background: rgba(0,0,0,0.45); pointer-events: auto;
+      }
+      #wr-victory .card {
+        background: #1a2332; color: #e7ecf3; border-radius: 16px;
+        padding: 22px 26px; max-width: 420px; text-align: center;
+        border: 2px solid #3dd68c; box-shadow: 0 12px 40px rgba(0,0,0,.5);
+        font: 14px/1.45 system-ui, sans-serif;
+      }
+      #wr-victory h2 { margin: 0 0 8px; font-size: 22px; color: #3dd68c; }
+      #wr-victory button {
+        margin-top: 14px; border: 0; border-radius: 8px; padding: 8px 14px;
+        background: #3d8bfd; color: #fff; font-weight: 600; cursor: pointer;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(st);
+  }
+  if (!hudRoot || !hudRoot.isConnected) {
+    hudRoot = document.createElement('div');
+    hudRoot.id = 'wr-hud';
+    hudRoot.innerHTML = '<header><span>Wikipedia Race</span><span class="wr-hud-toggle">▾</span></header><div class="wr-hud-body"></div>';
+    document.documentElement.appendChild(hudRoot);
+    hudRoot.querySelector('header').addEventListener('click', () => {
+      hudCollapsed = !hudCollapsed;
+      hudRoot.classList.toggle('collapsed', hudCollapsed);
+      hudRoot.querySelector('.wr-hud-toggle').textContent = hudCollapsed ? '▸' : '▾';
+    });
+  }
+  return hudRoot;
+}
+
+function renderHud() {
+  const lobby = raceCtx.lobby;
+  if (!lobby || (lobby.status !== 'racing' && lobby.status !== 'finished' && lobby.status !== 'waiting')) {
+    if (hudRoot) hudRoot.remove();
+    hudRoot = null;
+    if (hudTimer) { clearInterval(hudTimer); hudTimer = null; }
+    return;
+  }
+  // Show HUD in waiting (pick/lobby) and during/after race
+  const root = ensureHud();
+  const body = root.querySelector('.wr-hud-body');
+  const me = lobby.players?.find((p) => p.id === raceCtx.playerId);
+  const mode = lobby.mode === 'pick' ? 'Pick' : 'Classic';
+  let statusLine = lobby.status;
+  if (lobby.status === 'waiting' && lobby.mode === 'pick') {
+    statusLine = lobby.pickPhase === 'ready' ? 'Pick: ready' : 'Pick: ' + (lobby.pickPhase || 'start');
+  } else if (lobby.status === 'racing') statusLine = 'Racing';
+  else if (lobby.status === 'finished') statusLine = 'Finished';
+
+  const clicks = me?.clicks ?? 0;
+  let sw = '00:00.0';
+  if (lobby.startedAt && (lobby.status === 'racing' || lobby.status === 'finished')) {
+    const end = me?.finished && me.finishedAt ? me.finishedAt : Date.now();
+    sw = formatSw(end - lobby.startedAt);
+  }
+
+  const players = (lobby.players || [])
+    .slice()
+    .sort((a, b) => {
+      if (a.finished !== b.finished) return a.finished ? -1 : 1;
+      if (a.finished && b.finished) return (a.finishedAt || 0) - (b.finishedAt || 0);
+      return (a.clicks || 0) - (b.clicks || 0);
+    })
+    .map((p) => {
+      const cls = [p.id === raceCtx.playerId ? 'you' : '', p.finished ? 'done' : ''].filter(Boolean).join(' ');
+      const meta = p.finished && lobby.startedAt && p.finishedAt
+        ? p.clicks + ' · ' + formatSw(p.finishedAt - lobby.startedAt)
+        : String(p.clicks ?? 0);
+      return '<li class="' + cls + '"><span>' + escapeHtml(p.name) + (p.finished ? ' 🏆' : '') + '</span><span class="muted">' + meta + '</span></li>';
+    })
+    .join('');
+
+  body.innerHTML = `
+    <div class="row"><span class="muted">Lobby</span><span>${escapeHtml(lobby.code || '')} · ${mode}</span></div>
+    <div class="row"><span class="muted">Status</span><span>${escapeHtml(statusLine)}</span></div>
+    <div class="row"><span class="muted">Start</span><span>${escapeHtml(lobby.startPage?.title || '—')}</span></div>
+    <div class="row"><span class="muted">Target</span><span>${escapeHtml(lobby.targetPage?.title || '—')}</span></div>
+    <div class="row"><span class="muted">Clicks</span><span class="big">${clicks}</span></div>
+    <div class="row"><span class="muted">Time</span><span class="big" id="wr-hud-sw">${sw}</span></div>
+    <div class="muted" style="margin-top:8px;text-transform:uppercase;font-size:10px;letter-spacing:.04em">Players</div>
+    <ul>${players}</ul>
+    <p class="hint">Taken links are red + struck through. Back frees your last claim.</p>
+  `;
+
+  if (!hudTimer && lobby.status === 'racing') {
+    hudTimer = setInterval(() => {
+      const el = document.getElementById('wr-hud-sw');
+      const lob = raceCtx.lobby;
+      if (!el || !lob?.startedAt) return;
+      const m = lob.players?.find((p) => p.id === raceCtx.playerId);
+      const end = m?.finished && m.finishedAt ? m.finishedAt : Date.now();
+      el.textContent = formatSw(end - lob.startedAt);
+    }, 100);
+  }
+}
+
+function escapeHtml(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function getWinners(lobby) {
+  if (!lobby?.players) return [];
+  return lobby.players
+    .filter((p) => p.finished)
+    .slice()
+    .sort((a, b) => (a.finishedAt || 0) - (b.finishedAt || 0));
+}
+
+function renderVictory() {
+  const lobby = raceCtx.lobby;
+  const winners = getWinners(lobby);
+  if (!winners.length) {
+    const existing = document.getElementById('wr-victory');
+    if (existing && lobby?.status !== 'finished') {
+      /* keep dismissed banner away */
+    }
+    return;
+  }
+  const first = winners[0];
+  const key = first.id + ':' + (first.finishedAt || '');
+  if (victoryShownFor === key && document.getElementById('wr-victory')) return;
+  if (victoryShownFor === key + ':dismissed') return;
+  victoryShownFor = key;
+
+  ensureClaimsStyle();
+  let wrap = document.getElementById('wr-victory');
+  if (wrap) wrap.remove();
+  wrap = document.createElement('div');
+  wrap.id = 'wr-victory';
+  const time = lobby.startedAt && first.finishedAt ? formatSw(first.finishedAt - lobby.startedAt) : '—';
+  const you = first.id === raceCtx.playerId;
+  wrap.innerHTML = `
+    <div class="card">
+      <h2>${you ? 'You win!' : 'We have a winner!'}</h2>
+      <p><strong>${escapeHtml(first.name)}</strong> reached <strong>${escapeHtml(lobby.targetPage?.title || 'the target')}</strong></p>
+      <p>${first.clicks ?? 0} clicks · ${time}</p>
+      <button type="button" id="wr-victory-dismiss">Nice</button>
+    </div>
+  `;
+  document.documentElement.appendChild(wrap);
+  wrap.querySelector('#wr-victory-dismiss').addEventListener('click', () => {
+    victoryShownFor = key + ':dismissed';
+    wrap.remove();
+  });
+}
+
+function maybeAnnounceTargetReached() {
+  const lobby = raceCtx.lobby;
+  if (!lobby || lobby.status !== 'racing' || !lobby.targetPage) return;
+  const path = currentArticlePath();
+  const targetPath = canonicalWikiPath(lobby.targetPage.url) ||
+    canonicalWikiPath('/wiki/' + String(lobby.targetPage.title || '').replace(/ /g, '_'));
+  if (!path || !targetPath || !pathsEqual(path, targetPath)) return;
+  const me = lobby.players?.find((p) => p.id === raceCtx.playerId);
+  if (me?.finished) return;
+  // Force progress update with current title so server marks finish
+  const stack = loadStack();
+  const idx = loadIndex();
+  const clicks = idx >= 0 && stack[idx] ? stack[idx].clicks : me?.clicks ?? 0;
+  report('page_load', clicks);
+}
+

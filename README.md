@@ -1,21 +1,25 @@
 # Wikipedia Race
 
-Multiplayer Wikipedia racing game: join a lobby, get the same random English Wikipedia **start** and **target** articles, then navigate by clicking links. First to the target wins (lowest clicks / fastest time are both visible).
+Multiplayer Wikipedia racing game: join a lobby, race from a **start** article to a **target** on English Wikipedia. First to the target wins. Clicks and elapsed time are tracked live for everyone.
 
 This repo contains:
 
 - **`server/`** — Node.js + Express + WebSocket lobby/race server
 - **`extension/`** — Chrome Manifest V3 extension (popup + content script + service worker)
 
-## Features (MVP)
+## Features
 
 - Create / join lobby with a short code
-- Host starts the race → server picks two distinct random articles via the MediaWiki API
+- **Classic mode**: host starts → server picks two distinct random articles via the MediaWiki API
+- **Pick mode**: players take turns choosing the start and target (paste URL/title or **Use current tab**); host starts when both are set
 - Click counter: **+1** per article link navigation; **browser Back** undoes a click (never below 0), including bfcache restores
-- **Stopwatch** counting up from race start (not a countdown)
-- Extension popup shows live: lobby code, your name, connection status, start/target title+URL, clicks, stopwatch, player list / race status
+- Race start always seeds **0 clicks** on the start page
+- **Stopwatch** counting up from race start
+- Extension **popup** shows live: lobby, mode, name, connection, start/target, clicks, stopwatch, player list, winner banner
+- **On-page side HUD** (collapsible) on Wikipedia during lobby/race: mode, pages, your clicks, stopwatch, player list, claim hint
+- **Victory overlay** on Wikipedia for all players when someone reaches the target (winner name, clicks, time); popup winner banner too
 - **Live shared cursors** during a race (labeled pointers in **document/page space**, so they track content while scrolling)
-- **Claimed links**: when you take an in-article link, others still on that page see it **red + crossed out** and cannot follow it; **Backing out releases the claim** so others can take it again
+- **Claimed links**: when you take an in-article link, others still on that page see it **red + crossed out** and cannot follow it; **Backing out releases the claim**
 
 ## Requirements
 
@@ -36,18 +40,21 @@ Health: `GET /health`
 
 Optional: `PORT=4000 npm start`
 
+Public demo (if your VPS is up): `ws://51.81.33.210:3849/ws` (extension default).
+
 ## Load the Chrome extension
 
-1. Start the server (above).
+1. Start the server (above) or use the public WS URL.
 2. Open Chrome → `chrome://extensions`
 3. Enable **Developer mode** (top right).
-4. Click **Load unpacked** → select the **`extension/`** folder inside the repo (the folder that contains `manifest.json`), **not** the repo root. Loading `wikipedia-race/` itself fails with “Manifest file is missing”.
+4. Click **Load unpacked** → select the **`extension/`** folder inside the repo (the folder that contains `manifest.json`), **not** the repo root.
 5. Pin **Wikipedia Race** from the puzzle-piece menu.
 6. Open the popup:
-   - Confirm server URL (`ws://localhost:3847/ws`)
+   - Confirm server URL
    - Enter your name
-   - **Create lobby** or enter a code and **Join**
-7. Host clicks **Start race** — a Wikipedia tab opens on the start page. Navigate toward the target; watch clicks + stopwatch in the popup.
+   - Choose **Classic** or **Pick**, then **Create lobby** (or enter a code and **Join**)
+7. **Classic**: host clicks **Start race**. **Pick**: the start picker sets the start page, then the target picker sets the target (Use current tab works well); host starts when both are ready.
+8. A Wikipedia tab opens on the start page. Navigate toward the target; watch the **side HUD** and popup.
 
 ## Smoke test (no Chrome GUI)
 
@@ -57,7 +64,7 @@ With the server running in another terminal:
 npm run smoke
 ```
 
-This opens a WebSocket client, creates a lobby, starts a race, and checks that distinct start/target pages were returned.
+Checks health, classic race (clicks, claims, page-space cursors, finish detection), and Pick mode (page picks + start).
 
 ## Protocol (WebSocket JSON)
 
@@ -65,14 +72,20 @@ Client → server:
 
 | type | fields |
 |------|--------|
-| `create_lobby` | `name` |
+| `create_lobby` | `name`, optional `mode` (`classic` \| `pick`) |
 | `join_lobby` | `code`, `name` |
+| `set_mode` | `mode` (host, waiting only) |
+| `set_pick_page` | `role` (`start` \| `target`), `title` and/or `url` |
 | `start_race` | (host only) |
 | `update_progress` | `clicks`, `currentTitle`, `currentUrl` |
+| `link_claim` / `link_unclaim` | `sourcePath`, `targetPath` |
+| `cursor_update` | `x`, `y`, `pagePath` (page coordinates) |
 | `leave_lobby` | |
 | `ping` | |
 
-Server → client: `hello`, `lobby_created`, `lobby_joined`, `lobby_update`, `race_preparing`, `race_started`, `error`, `pong`. Each lobby payload includes `code`, `status`, `startPage`, `targetPage`, `startedAt`, and `players[]`.
+Server → client: `hello`, `lobby_created`, `lobby_joined`, `lobby_update`, `race_preparing`, `race_started`, `link_claimed`, `link_unclaimed`, `cursor_update`, `error`, `pong`.
+
+Lobby payloads include `code`, `status`, `mode`, `pickPhase`, picker ids, `startPage`, `targetPage`, `startedAt`, and `players[]` (with `finished` / `finishedAt` when someone wins).
 
 ## Project layout
 
@@ -90,14 +103,6 @@ wikipedia-race/
   README.md
 ```
 
-## Known gaps / next steps
-
-- Full Chrome GUI testing (popup live updates, Back undo) still needs a real browser pass
-- No auth, skins, avatars, or persistent leaderboards yet
-- Click counting relies on content-script heuristics + `sessionStorage` / `history.state`; edge cases (middle-click, external redirects) are out of MVP scope
-- Remote server needs `host_permissions` updated if not localhost
-
-
 ## Deploy (VPS)
 
 If the game server runs on a VPS (e.g. under `~/wikipedia-race`):
@@ -106,7 +111,7 @@ If the game server runs on a VPS (e.g. under `~/wikipedia-race`):
 cd ~/wikipedia-race && git pull && sudo systemctl restart wikipedia-race
 ```
 
-Reload the Chrome extension (chrome://extensions → Reload) after pulling extension changes.
+Reload the Chrome extension (`chrome://extensions` → Reload) after pulling extension changes.
 
 ## License
 

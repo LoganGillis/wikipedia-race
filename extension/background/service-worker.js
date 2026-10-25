@@ -39,14 +39,24 @@ function broadcastToExtension(msg) {
   forwardToWikiTabs(msg);
 }
 
+async function listWikiTabs() {
+  // Match-pattern query is flaky across Chrome builds; filter manually.
+  const tabs = await chrome.tabs.query({});
+  return tabs.filter(
+    (t) => t.id != null && t.url && /https?:\/\/[^/]*wikipedia\.org\//i.test(t.url)
+  );
+}
+
 async function forwardToWikiTabs(msg) {
   try {
-    const tabs = await chrome.tabs.query({ url: ['https://*.wikipedia.org/*'] });
-    for (const tab of tabs) {
-      if (tab.id != null) {
-        chrome.tabs.sendMessage(tab.id, msg).catch(() => {});
-      }
-    }
+    const tabs = await listWikiTabs();
+    await Promise.all(
+      tabs.map((tab) =>
+        chrome.tabs.sendMessage(tab.id, msg).catch(() => {
+          /* content script may not be injected yet */
+        })
+      )
+    );
   } catch (_) {}
 }
 
@@ -209,9 +219,8 @@ async function removeClaims(list, sourcePath, targetPath) {
 
 /** Clear click stack in open wiki tabs and mark next load as race seed (0 clicks). */
 async function seedRaceNavigationInWikiTabs() {
-  const tabs = await chrome.tabs.query({ url: ['https://*.wikipedia.org/*'] });
+  const tabs = await listWikiTabs();
   for (const tab of tabs) {
-    if (tab.id == null) continue;
     try {
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
@@ -222,6 +231,7 @@ async function seedRaceNavigationInWikiTabs() {
             sessionStorage.removeItem('__wr_pending');
             sessionStorage.removeItem('__wr_claim_edges');
             sessionStorage.setItem('__wr_seed_next', '1');
+            sessionStorage.setItem('__wr_racing', '1');
           } catch (_) {}
         },
       });
@@ -234,7 +244,7 @@ async function seedRaceNavigationInWikiTabs() {
 
 async function openRaceTab(url) {
   await seedRaceNavigationInWikiTabs();
-  const tabs = await chrome.tabs.query({ url: ['https://*.wikipedia.org/*'] });
+  const tabs = await listWikiTabs();
   if (tabs[0]?.id) {
     await chrome.tabs.update(tabs[0].id, { url, active: true });
   } else {
@@ -279,7 +289,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse({ ok: false, error: 'Not connected' });
         return;
       }
-      send('create_lobby', { name });
+      send('create_lobby', { name, mode: msg.mode === 'pick' ? 'pick' : 'classic' });
       sendResponse({ ok: true });
       return;
     }
@@ -300,6 +310,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse({ ok: true });
       return;
     }
+    if (msg.type === 'set_mode') {
+      send('set_mode', { mode: msg.mode });
+      sendResponse({ ok: true });
+      return;
+    }
+    if (msg.type === 'set_pick_page') {
+      send('set_pick_page', {
+        role: msg.role,
+        title: msg.title,
+        url: msg.url,
+      });
+      sendResponse({ ok: true });
+      return;
+    }
     if (msg.type === 'leave_lobby') {
       send('leave_lobby');
       await saveState({ lobby: null, playerId: null });
@@ -312,20 +336,26 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       return;
     }
     if (msg.type === 'cursor_update') {
-      send('cursor_update', {
+      if (!(socket && socket.readyState === WebSocket.OPEN)) {
+        await ensureConnected();
+      }
+      const ok = send('cursor_update', {
         x: msg.x,
         y: msg.y,
         pagePath: msg.pagePath,
       });
-      sendResponse({ ok: true });
+      sendResponse({ ok });
       return;
     }
     if (msg.type === 'link_claim') {
-      send('link_claim', {
+      if (!(socket && socket.readyState === WebSocket.OPEN)) {
+        await ensureConnected();
+      }
+      const ok = send('link_claim', {
         sourcePath: msg.sourcePath,
         targetPath: msg.targetPath,
       });
-      sendResponse({ ok: true });
+      sendResponse({ ok });
       return;
     }
     if (msg.type === 'link_unclaim') {

@@ -193,3 +193,36 @@ hr {
 .players .you { outline: 1px solid var(--accent); }
 .players .done { color: var(--good); }
 .players .offline { opacity: 0.55; }
+
+
+select {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #0f1419;
+  color: var(--text);
+  font-size: 13px;
+}
+.mode-controls { margin-top: 10px; }
+.mode-controls .hint {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+button.active {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.winner {
+  margin-top: 10px;
+  padding: 10px;
+  border-radius: 8px;
+  background: rgba(61, 214, 140, 0.15);
+  border: 1px solid var(--good);
+  color: var(--good);
+  font-weight: 700;
+  font-size: 13px;
+}

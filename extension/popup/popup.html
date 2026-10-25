@@ -21,6 +21,13 @@
       Your name
       <input id="playerName" type="text" maxlength="24" placeholder="Player" />
     </label>
+    <label>
+      Mode
+      <select id="createMode">
+        <option value="classic">Classic (random start &amp; target)</option>
+        <option value="pick">Pick (players choose pages)</option>
+      </select>
+    </label>
     <div class="row">
       <button id="btnConnect" type="button" class="secondary">Connect</button>
       <button id="btnCreate" type="button">Create lobby</button>
@@ -42,9 +49,30 @@
       <span id="youName" class="v"></span>
     </div>
     <div class="kv">
+      <span class="k">Mode</span>
+      <span id="modeLabel" class="v"></span>
+    </div>
+    <div class="kv">
       <span class="k">Status</span>
       <span id="raceStatus" class="v"></span>
     </div>
+
+    <div id="modeControls" class="mode-controls" hidden>
+      <p class="hint" id="modeHint"></p>
+      <div class="row" id="hostModeRow" hidden>
+        <button id="btnModeClassic" type="button" class="secondary">Classic</button>
+        <button id="btnModePick" type="button" class="secondary">Pick</button>
+      </div>
+      <div id="pickActions" hidden>
+        <input id="pickUrl" type="text" placeholder="Paste Wikipedia URL or title" />
+        <div class="row">
+          <button id="btnUseTab" type="button">Use current tab</button>
+          <button id="btnSubmitPick" type="button" class="secondary">Set page</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="winnerBanner" class="winner" hidden></div>
 
     <div id="raceMeta" hidden>
       <hr />

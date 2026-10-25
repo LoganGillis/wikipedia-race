@@ -52,20 +52,14 @@ function connect() {
   });
 }
 
-async function main() {
-  console.log('GET', HEALTH);
-  const healthRes = await fetch(HEALTH);
-  if (!healthRes.ok) throw new Error(`Health HTTP ${healthRes.status}`);
-  const health = await healthRes.json();
-  console.log('health:', health);
-  if (!health.ok) throw new Error('Health not ok');
-
+async function classicRaceFlow() {
   const ws = await connect();
   await ws.wait((m) => m.type === 'hello');
 
-  ws.send(JSON.stringify({ type: 'create_lobby', name: 'SmokeTester' }));
+  ws.send(JSON.stringify({ type: 'create_lobby', name: 'SmokeTester', mode: 'classic' }));
   const created = await ws.wait((m) => m.type === 'lobby_created');
-  console.log('lobby:', created.lobby.code, 'name:', created.lobby.players[0].name);
+  console.log('classic lobby:', created.lobby.code, 'mode:', created.lobby.mode);
+  if (created.lobby.mode !== 'classic') throw new Error('expected classic mode');
   if (created.lobby.players[0].name !== 'SmokeTester') {
     throw new Error('Full name not preserved');
   }
@@ -107,8 +101,6 @@ async function main() {
   if (me.clicks !== 3) throw new Error('Click update failed');
   console.log('clicks after update:', me.clicks);
 
-  const sourcePath = '/wiki/' + encodeURIComponent(startPage.title.replace(/ /g, '_'));
-  // Server normalizeWikiPath decodes; send a clean path
   const sourcePathClean = '/wiki/' + startPage.title.replace(/ /g, '_');
   const targetPath = '/wiki/Some_Claimed_Article';
 
@@ -140,18 +132,136 @@ async function main() {
   console.log('unclaimed count:', (unclaimed.claims || []).length);
   if (!unclaimed.claims?.length) throw new Error('expected unclaimed claims array');
 
+  // Finish by landing on target (path match)
+  const finishWait = ws2.wait(
+    (m) =>
+      m.type === 'lobby_update' &&
+      m.lobby.players.some((p) => p.id === created.playerId && p.finished)
+  );
+  ws.send(
+    JSON.stringify({
+      type: 'update_progress',
+      clicks: 5,
+      currentTitle: targetPage.title,
+      currentUrl: targetPage.url,
+    })
+  );
+  const finished = await finishWait;
+  const winner = finished.lobby.players.find((p) => p.id === created.playerId);
+  if (!winner.finished || !winner.finishedAt) throw new Error('finish detection failed');
+  console.log('finish ok:', winner.name, winner.clicks, 'clicks');
+
+  ws.close();
+  ws2.close();
+}
+
+async function pickModeFlow() {
+  const host = await connect();
+  await host.wait((m) => m.type === 'hello');
+  host.send(JSON.stringify({ type: 'create_lobby', name: 'PickHost', mode: 'pick' }));
+  const created = await host.wait((m) => m.type === 'lobby_created');
+  if (created.lobby.mode !== 'pick') throw new Error('expected pick mode');
+  if (created.lobby.pickPhase !== 'start') throw new Error('expected pickPhase start');
+  console.log('pick lobby:', created.lobby.code, 'phase:', created.lobby.pickPhase);
+
+  const guest = await connect();
+  await guest.wait((m) => m.type === 'hello');
+  guest.send(
+    JSON.stringify({ type: 'join_lobby', code: created.lobby.code, name: 'PickGuest' })
+  );
+  await guest.wait((m) => m.type === 'lobby_joined');
+  const afterJoin = await host.wait((m) => m.type === 'lobby_update');
+  if (!afterJoin.lobby.startPickerId || !afterJoin.lobby.targetPickerId) {
+    throw new Error('pickers not assigned');
+  }
+  console.log(
+    'pickers start=',
+    afterJoin.lobby.startPickerId.slice(0, 8),
+    'target=',
+    afterJoin.lobby.targetPickerId.slice(0, 8)
+  );
+
+  // Host sets start (host is always start picker when alone then reassigned)
+  const startPicker = afterJoin.lobby.startPickerId;
+  const targetPicker = afterJoin.lobby.targetPickerId;
+  const startWs = startPicker === created.playerId ? host : guest;
+  const targetWs = targetPicker === created.playerId ? host : guest;
+  const startPid = startPicker;
+  const targetPid = targetPicker;
+
+  startWs.send(
+    JSON.stringify({
+      type: 'set_pick_page',
+      role: 'start',
+      title: 'Python (programming language)',
+      url: 'https://en.wikipedia.org/wiki/Python_(programming_language)',
+    })
+  );
+  const afterStart = await host.wait(
+    (m) => m.type === 'lobby_update' && m.lobby.startPage
+  );
+  if (!afterStart.lobby.startPage?.title) throw new Error('start page not set');
+  if (afterStart.lobby.pickPhase !== 'target') throw new Error('expected target phase');
+  console.log('pick start set:', afterStart.lobby.startPage.title);
+
+  targetWs.send(
+    JSON.stringify({
+      type: 'set_pick_page',
+      role: 'target',
+      title: 'JavaScript',
+      url: 'https://en.wikipedia.org/wiki/JavaScript',
+    })
+  );
+  const afterTarget = await host.wait(
+    (m) => m.type === 'lobby_update' && m.lobby.targetPage && m.lobby.pickPhase === 'ready'
+  );
+  console.log('pick target set:', afterTarget.lobby.targetPage.title);
+
+  host.send(JSON.stringify({ type: 'start_race' }));
+  const started = await host.wait(
+    (m) => m.type === 'race_started' || m.type === 'error',
+    10000
+  );
+  if (started.type === 'error') throw new Error(started.message);
+  await guest.wait((m) => m.type === 'race_started', 10000);
+  if (started.lobby.startPage.title !== 'Python (programming language)') {
+    throw new Error('pick start not used');
+  }
+  if (started.lobby.targetPage.title !== 'JavaScript') {
+    throw new Error('pick target not used');
+  }
+  console.log('pick race started with chosen pages');
+
+  // Mode switch on new lobby
   const ws3 = await connect();
   await ws3.wait((m) => m.type === 'hello');
-  ws3.send(JSON.stringify({ type: 'create_lobby', name: '  Tester Name  ' }));
+  ws3.send(JSON.stringify({ type: 'create_lobby', name: '  Tester Name  ', mode: 'classic' }));
   const c3 = await ws3.wait((m) => m.type === 'lobby_created');
   if (c3.lobby.players[0].name !== 'Tester Name') {
     throw new Error(`Name sanitize failed: ${c3.lobby.players[0].name}`);
   }
-  console.log('sanitized name ok:', c3.lobby.players[0].name);
+  ws3.send(JSON.stringify({ type: 'set_mode', mode: 'pick' }));
+  const switched = await ws3.wait(
+    (m) => m.type === 'lobby_update' && m.lobby.mode === 'pick'
+  );
+  if (switched.lobby.pickPhase !== 'start') throw new Error('mode switch failed');
+  console.log('sanitized name + mode switch ok');
 
-  ws.close();
-  ws2.close();
+  host.close();
+  guest.close();
   ws3.close();
+}
+
+async function main() {
+  console.log('GET', HEALTH);
+  const healthRes = await fetch(HEALTH);
+  if (!healthRes.ok) throw new Error(`Health HTTP ${healthRes.status}`);
+  const health = await healthRes.json();
+  console.log('health:', health);
+  if (!health.ok) throw new Error('Health not ok');
+
+  await classicRaceFlow();
+  await pickModeFlow();
   console.log('\nSMOKE OK');
 }
 

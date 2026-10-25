@@ -35,10 +35,9 @@ const socketPlayers = new Map();
  */
 
 /**
- * Claim: on source page, target article path was taken by a player.
  * @typedef {object} LinkClaim
- * @property {string} sourcePath  e.g. /wiki/Start
- * @property {string} targetPath  e.g. /wiki/Foo
+ * @property {string} sourcePath
+ * @property {string} targetPath
  * @property {string} playerId
  * @property {string} playerName
  */
@@ -48,6 +47,10 @@ const socketPlayers = new Map();
  * @property {string} code
  * @property {Map<string, Player>} players
  * @property {'waiting'|'racing'|'finished'} status
+ * @property {'classic'|'pick'} mode
+ * @property {'start'|'target'|'ready'|null} pickPhase
+ * @property {string|null} startPickerId
+ * @property {string|null} targetPickerId
  * @property {WikiPage|null} startPage
  * @property {WikiPage|null} targetPage
  * @property {number|null} startedAt
@@ -66,7 +69,47 @@ function makeLobbyCode() {
 }
 
 function wikiUrl(title) {
-  return `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, '_'))}`;
+  const slug = String(title).trim().replace(/ /g, '_');
+  return `https://en.wikipedia.org/wiki/${encodeURIComponent(slug).replace(/%2F/gi, '/')}`;
+}
+
+/** Canonical article path: /wiki/Title_With_Underscores (decoded, spaces→_). */
+function normalizeWikiPath(path) {
+  if (!path || typeof path !== 'string') return null;
+  let p = path.trim();
+  try {
+    if (p.startsWith('http://') || p.startsWith('https://')) {
+      p = new URL(p).pathname;
+    }
+  } catch {
+    return null;
+  }
+  if (!p.startsWith('/wiki/')) return null;
+  p = p.split('?')[0].split('#')[0];
+  let rest = p.slice('/wiki/'.length);
+  try {
+    rest = decodeURIComponent(rest);
+  } catch {
+    /* keep */
+  }
+  rest = rest.replace(/ /g, '_');
+  if (!rest || rest.includes(':')) return null;
+  return '/wiki/' + rest;
+}
+
+function pageFromTitleOrUrl(title, url) {
+  let t = String(title || '').trim();
+  let u = String(url || '').trim();
+  if (!t && u) {
+    const path = normalizeWikiPath(u);
+    if (path) t = path.slice('/wiki/'.length).replace(/_/g, ' ');
+  }
+  if (!t) return null;
+  if (!u) u = wikiUrl(t);
+  const path = normalizeWikiPath(u) || normalizeWikiPath('/wiki/' + t.replace(/ /g, '_'));
+  if (!path) return null;
+  const normalizedTitle = path.slice('/wiki/'.length).replace(/_/g, ' ');
+  return { title: normalizedTitle, url: wikiUrl(normalizedTitle) };
 }
 
 async function fetchRandomArticles(count) {
@@ -81,7 +124,7 @@ async function fetchRandomArticles(count) {
   const res = await fetch(url, {
     headers: {
       'User-Agent':
-        'WikipediaRace/1.0 (educational game; contact: github.com/LoganGillis/wikipedia-race)',
+        'WikipediaRace/1.1 (educational game; contact: github.com/LoganGillis/wikipedia-race)',
     },
   });
   if (!res.ok) throw new Error(`Wikipedia API HTTP ${res.status}`);
@@ -122,10 +165,22 @@ function publicPlayer(p) {
   };
 }
 
+function assignPickers(lobby) {
+  const list = [...lobby.players.values()];
+  const host = list.find((p) => p.isHost) || list[0];
+  const other = list.find((p) => p.id !== host?.id) || host;
+  lobby.startPickerId = host?.id || null;
+  lobby.targetPickerId = other?.id || null;
+}
+
 function lobbySnapshot(lobby) {
   return {
     code: lobby.code,
     status: lobby.status,
+    mode: lobby.mode || 'classic',
+    pickPhase: lobby.pickPhase,
+    startPickerId: lobby.startPickerId,
+    targetPickerId: lobby.targetPickerId,
     startPage: lobby.startPage,
     targetPage: lobby.targetPage,
     startedAt: lobby.startedAt,
@@ -147,7 +202,6 @@ function broadcastLobby(lobby, type, extra = {}) {
   }
 }
 
-/** Broadcast a light message to lobby members; optionally skip one player. */
 function broadcastRaw(lobby, type, payload, exceptPlayerId = null) {
   for (const p of lobby.players.values()) {
     if (exceptPlayerId && p.id === exceptPlayerId) continue;
@@ -188,14 +242,19 @@ function detachSocket(ws) {
   }
 }
 
-function createLobby(ws, name) {
+function createLobby(ws, name, mode) {
   const code = makeLobbyCode();
   const playerId = randomUUID();
+  const resolvedMode = mode === 'pick' ? 'pick' : 'classic';
   /** @type {Lobby} */
   const lobby = {
     code,
     players: new Map(),
     status: 'waiting',
+    mode: resolvedMode,
+    pickPhase: resolvedMode === 'pick' ? 'start' : null,
+    startPickerId: null,
+    targetPickerId: null,
     startPage: null,
     targetPage: null,
     startedAt: null,
@@ -214,6 +273,7 @@ function createLobby(ws, name) {
     isHost: true,
   };
   lobby.players.set(playerId, player);
+  assignPickers(lobby);
   lobbies.set(code, lobby);
   socketPlayers.set(ws, playerId);
   send(ws, 'lobby_created', { playerId, lobby: lobbySnapshot(lobby) });
@@ -244,8 +304,75 @@ function joinLobby(ws, code, name) {
     isHost: false,
   };
   lobby.players.set(playerId, player);
+  if (lobby.mode === 'pick') assignPickers(lobby);
   socketPlayers.set(ws, playerId);
   send(ws, 'lobby_joined', { playerId, lobby: lobbySnapshot(lobby) });
+  broadcastLobby(lobby, 'lobby_update');
+}
+
+function setMode(ws, mode) {
+  const playerId = socketPlayers.get(ws);
+  if (!playerId) return;
+  const lobby = findLobbyByPlayer(playerId);
+  if (!lobby) return;
+  const player = lobby.players.get(playerId);
+  if (!player?.isHost) {
+    send(ws, 'error', { message: 'Only the host can change mode' });
+    return;
+  }
+  if (lobby.status !== 'waiting') {
+    send(ws, 'error', { message: 'Cannot change mode after race start' });
+    return;
+  }
+  const next = mode === 'pick' ? 'pick' : 'classic';
+  lobby.mode = next;
+  lobby.startPage = null;
+  lobby.targetPage = null;
+  if (next === 'pick') {
+    lobby.pickPhase = 'start';
+    assignPickers(lobby);
+  } else {
+    lobby.pickPhase = null;
+    lobby.startPickerId = null;
+    lobby.targetPickerId = null;
+  }
+  broadcastLobby(lobby, 'lobby_update');
+}
+
+function setPickPage(ws, msg) {
+  const playerId = socketPlayers.get(ws);
+  if (!playerId) return;
+  const lobby = findLobbyByPlayer(playerId);
+  if (!lobby) return;
+  if (lobby.status !== 'waiting' || lobby.mode !== 'pick') {
+    send(ws, 'error', { message: 'Not in Pick mode waiting lobby' });
+    return;
+  }
+  const role = msg.role === 'target' ? 'target' : 'start';
+  const allowedId = role === 'start' ? lobby.startPickerId : lobby.targetPickerId;
+  if (playerId !== allowedId) {
+    send(ws, 'error', { message: `Not your turn to pick the ${role} page` });
+    return;
+  }
+  const page = pageFromTitleOrUrl(msg.title, msg.url);
+  if (!page) {
+    send(ws, 'error', { message: 'Invalid Wikipedia article' });
+    return;
+  }
+  if (role === 'start') {
+    lobby.startPage = page;
+    if (lobby.targetPage && normalizeTitle(lobby.targetPage.title) === normalizeTitle(page.title)) {
+      lobby.targetPage = null;
+    }
+    lobby.pickPhase = lobby.targetPage ? 'ready' : 'target';
+  } else {
+    if (lobby.startPage && normalizeTitle(lobby.startPage.title) === normalizeTitle(page.title)) {
+      send(ws, 'error', { message: 'Target must differ from start' });
+      return;
+    }
+    lobby.targetPage = page;
+    lobby.pickPhase = lobby.startPage ? 'ready' : 'start';
+  }
   broadcastLobby(lobby, 'lobby_update');
 }
 
@@ -272,11 +399,28 @@ async function startRace(ws) {
 
   send(ws, 'race_preparing', {});
   try {
-    const { startPage, targetPage } = await pickStartAndTarget();
+    let startPage;
+    let targetPage;
+    if (lobby.mode === 'pick') {
+      if (!lobby.startPage || !lobby.targetPage) {
+        send(ws, 'error', { message: 'Pick mode needs both start and target pages' });
+        return;
+      }
+      if (normalizeTitle(lobby.startPage.title) === normalizeTitle(lobby.targetPage.title)) {
+        send(ws, 'error', { message: 'Start and target must be different' });
+        return;
+      }
+      startPage = lobby.startPage;
+      targetPage = lobby.targetPage;
+    } else {
+      ({ startPage, targetPage } = await pickStartAndTarget());
+    }
+
     lobby.startPage = startPage;
     lobby.targetPage = targetPage;
     lobby.startedAt = Date.now();
     lobby.status = 'racing';
+    lobby.pickPhase = null;
     lobby.claims = [];
     for (const p of lobby.players.values()) {
       p.clicks = 0;
@@ -311,11 +455,20 @@ function updateProgress(ws, payload) {
   }
 
   const targetTitle = lobby.targetPage?.title;
-  if (
+  const targetPath = lobby.targetPage?.url
+    ? normalizeWikiPath(lobby.targetPage.url)
+    : null;
+  const currentPath = player.currentUrl
+    ? normalizeWikiPath(player.currentUrl)
+    : player.currentTitle
+      ? normalizeWikiPath('/wiki/' + String(player.currentTitle).replace(/ /g, '_'))
+      : null;
+  const titleHit =
     targetTitle &&
     player.currentTitle &&
-    normalizeTitle(player.currentTitle) === normalizeTitle(targetTitle)
-  ) {
+    normalizeTitle(player.currentTitle) === normalizeTitle(targetTitle);
+  const pathHit = targetPath && currentPath && targetPath === currentPath;
+  if ((titleHit || pathHit) && !player.finished) {
     player.finished = true;
     player.finishedAt = Date.now();
   }
@@ -334,28 +487,6 @@ function normalizeTitle(t) {
   return String(t).replace(/_/g, ' ').trim().toLowerCase();
 }
 
-function normalizeWikiPath(path) {
-  if (!path || typeof path !== 'string') return null;
-  let p = path.trim();
-  try {
-    if (p.startsWith('http://') || p.startsWith('https://')) {
-      p = new URL(p).pathname;
-    }
-  } catch {
-    return null;
-  }
-  if (!p.startsWith('/wiki/')) return null;
-  // Drop fragment/query if somehow present
-  p = p.split('?')[0].split('#')[0];
-  // Decode then re-encode consistently via decode for comparison key
-  try {
-    p = '/wiki/' + decodeURIComponent(p.slice('/wiki/'.length));
-  } catch {
-    /* keep raw */
-  }
-  return p;
-}
-
 function handleCursor(ws, msg) {
   const playerId = socketPlayers.get(ws);
   if (!playerId) return;
@@ -366,7 +497,6 @@ function handleCursor(ws, msg) {
   const x = Number(msg.x);
   const y = Number(msg.y);
   if (!Number.isFinite(x) || !Number.isFinite(y)) return;
-  // Page-space pixel coords (pageX/pageY); do not clamp to viewport 0..1
   const pagePath = normalizeWikiPath(msg.pagePath) || '';
   broadcastRaw(
     lobby,
@@ -398,11 +528,11 @@ function handleLinkClaim(ws, msg) {
     (c) => c.sourcePath === sourcePath && c.targetPath === targetPath
   );
   if (exists) {
-    // Already claimed — still re-broadcast so late joiners/tabs sync
     const claim = lobby.claims.find(
       (c) => c.sourcePath === sourcePath && c.targetPath === targetPath
     );
-    broadcastRaw(lobby, 'link_claimed', { claim });
+    // Broadcast to everyone (including claimer) for UI sync
+    broadcastRaw(lobby, 'link_claimed', { claim }, null);
     return;
   }
 
@@ -413,10 +543,9 @@ function handleLinkClaim(ws, msg) {
     playerName: player.name,
   };
   lobby.claims.push(claim);
-  broadcastRaw(lobby, 'link_claimed', { claim });
+  broadcastRaw(lobby, 'link_claimed', { claim }, null);
 }
 
-/** Release claim(s) — used when a player backs out of a navigation step. */
 function handleLinkUnclaim(ws, msg) {
   const playerId = socketPlayers.get(ws);
   if (!playerId) return;
@@ -457,7 +586,7 @@ function handleLinkUnclaim(ws, msg) {
   lobby.claims = lobby.claims.filter(
     (c) => !keys.has(`${c.sourcePath}::${c.targetPath}`)
   );
-  broadcastRaw(lobby, 'link_unclaimed', { claims: toRemove });
+  broadcastRaw(lobby, 'link_unclaimed', { claims: toRemove }, null);
 }
 
 function leaveLobby(ws) {
@@ -477,6 +606,7 @@ function leaveLobby(ws) {
     const next = lobby.players.values().next().value;
     if (next) next.isHost = true;
   }
+  if (lobby.mode === 'pick' && lobby.status === 'waiting') assignPickers(lobby);
   broadcastLobby(lobby, 'lobby_update');
 }
 
@@ -516,10 +646,16 @@ wss.on('connection', (ws) => {
     try {
       switch (type) {
         case 'create_lobby':
-          createLobby(ws, msg.name);
+          createLobby(ws, msg.name, msg.mode);
           break;
         case 'join_lobby':
           joinLobby(ws, msg.code, msg.name);
+          break;
+        case 'set_mode':
+          setMode(ws, msg.mode);
+          break;
+        case 'set_pick_page':
+          setPickPage(ws, msg);
           break;
         case 'start_race':
           await startRace(ws);
