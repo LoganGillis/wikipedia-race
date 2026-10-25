@@ -1,6 +1,6 @@
 # Wikipedia Race
 
-Multiplayer Wikipedia racing game: join a lobby, race from a **start** article to a **target** on English Wikipedia. First to the target wins. Clicks and elapsed time are tracked live for everyone.
+Multiplayer Wikipedia racing game: join a lobby, race from a **start** article to a **target** on English Wikipedia. **First to the target wins** — the race ends for everyone as soon as someone arrives. Clicks and elapsed time are tracked live for everyone.
 
 This repo contains:
 
@@ -74,6 +74,7 @@ Client → server:
 |------|--------|
 | `create_lobby` | `name`, optional `mode` (`classic` \| `pick`) |
 | `join_lobby` | `code`, `name` |
+| `resume_session` | `code`, `playerId`, optional `name` (reattach after disconnect) |
 | `set_mode` | `mode` (host, waiting only) |
 | `set_pick_page` | `role` (`start` \| `target`), `title` and/or `url` |
 | `start_race` | (host only) |
@@ -102,6 +103,14 @@ wikipedia-race/
   package.json
   README.md
 ```
+
+
+## Multiplayer tips (cursors & claims)
+
+- **Both players must use the same server URL** in the popup (default `ws://51.81.33.210:3849/ws`, or your own `ws://host:port/ws`).
+- After pulling extension changes: `chrome://extensions` → **Reload** the unpacked extension on **every** profile.
+- After server changes on a VPS: `cd ~/wikipedia-race && git pull && sudo systemctl restart wikipedia-race`.
+- Shared cursors and claimed-link blocking need a live WebSocket. The extension keeps the MV3 service worker awake with an offscreen document, alarms, and content-script keepalives; if the connection drops mid-race it **resumes** the same `playerId` automatically.
 
 ## Deploy (VPS)
 

@@ -1,5 +1,14 @@
 'use strict';
 
+if (globalThis.__wrContentLoaded) {
+  // Re-injected; ask existing instance to refresh
+  try {
+    chrome.runtime.sendMessage({ type: 'get_state' }, () => {});
+  } catch (_) {}
+} else {
+(function wrMain() {
+globalThis.__wrContentLoaded = true;
+
 /**
  * Wikipedia Race content script
  *
@@ -311,7 +320,40 @@ function onPageShow() {
   const { clicks, kind } = reconcileNavigation();
   report(kind, clicks);
   refreshClaimsUi();
-  syncRaceContext();
+  
+/* Keep MV3 service worker + WS alive while on Wikipedia during a lobby/race */
+let wrKeepalivePort = null;
+function connectKeepalivePort() {
+  try {
+    wrKeepalivePort = chrome.runtime.connect({ name: 'wr-keepalive' });
+    wrKeepalivePort.onDisconnect.addListener(() => {
+      wrKeepalivePort = null;
+      setTimeout(connectKeepalivePort, 1000);
+    });
+  } catch (_) {
+    setTimeout(connectKeepalivePort, 2000);
+  }
+}
+connectKeepalivePort();
+setInterval(() => {
+  const inLobby =
+    raceCtx.lobby ||
+    raceCtx.racing ||
+    sessionStorage.getItem('__wr_racing') === '1';
+  if (!inLobby) return;
+  try {
+    if (wrKeepalivePort) wrKeepalivePort.postMessage({ type: 'ping' });
+  } catch (_) {
+    connectKeepalivePort();
+  }
+  chrome.runtime.sendMessage({ type: 'keepalive', source: 'content' }).catch(() => {});
+  chrome.runtime.sendMessage({ type: 'get_state' }, (res) => {
+    if (chrome.runtime.lastError || !res?.state) return;
+    applyState(res.state);
+  });
+}, 15000);
+
+syncRaceContext();
 }
 
 document.addEventListener(
@@ -525,23 +567,26 @@ function ensureClaimsStyle() {
     }
     .wr-cursor {
       position: absolute;
-      transform: translate(-2px, -2px);
-      transition: left 50ms linear, top 50ms linear;
+      transform: translate(-3px, -3px);
+      transition: left 40ms linear, top 40ms linear;
       display: flex;
       align-items: center;
-      gap: 4px;
+      gap: 6px;
       will-change: left, top;
+      z-index: 2147483647;
     }
     .wr-cursor.is-offscreen { visibility: hidden; }
-    .wr-cursor svg { display: block; filter: drop-shadow(0 1px 1px rgba(0,0,0,.4)); }
+    .wr-cursor svg { display: block; width: 24px; height: 28px; filter: drop-shadow(0 2px 3px rgba(0,0,0,.55)); }
     .wr-cursor-label {
-      font: 600 11px/1.2 system-ui, sans-serif;
+      font: 700 13px/1.25 system-ui, sans-serif;
       color: #fff;
-      background: rgba(15, 20, 25, 0.85);
-      border-radius: 4px;
-      padding: 2px 6px;
+      background: #0b1220;
+      border-radius: 6px;
+      padding: 3px 8px;
       white-space: nowrap;
-      border: 1px solid rgba(255,255,255,.2);
+      border: 2px solid #fff;
+      box-shadow: 0 2px 8px rgba(0,0,0,.45);
+      text-shadow: 0 1px 0 rgba(0,0,0,.4);
     }
   `;
   (document.head || document.documentElement).appendChild(claimsStyleEl);
@@ -584,11 +629,11 @@ function renderCursor(playerId) {
     el.className = 'wr-cursor';
     const color = colorForId(playerId);
     el.innerHTML = `
-      <svg width="18" height="22" viewBox="0 0 18 22" xmlns="http://www.w3.org/2000/svg">
+      <svg width="24" height="28" viewBox="0 0 18 22" xmlns="http://www.w3.org/2000/svg">
         <path d="M1 1 L1 17 L5.5 13.5 L9 21 L12 19.5 L8.5 12 L15 12 Z"
-          fill="${color}" stroke="#fff" stroke-width="1"/>
+          fill="${color}" stroke="#fff" stroke-width="1.4"/>
       </svg>
-      <span class="wr-cursor-label" style="border-color:${color}"></span>
+      <span class="wr-cursor-label" style="border-color:${color};background:${color}"></span>
     `;
     layer.appendChild(el);
     cursorEls.set(playerId, el);
@@ -664,9 +709,11 @@ chrome.runtime.onMessage.addListener((msg) => {
     if (!raceCtx.racing && sessionStorage.getItem('__wr_racing') !== '1') return;
     raceCtx.racing = true;
     const myPath = currentArticlePath();
-    if (msg.pagePath && myPath && !pathsEqual(msg.pagePath, myPath)) {
-      removeCursor(msg.playerId);
-      return;
+    const remotePath = canonicalWikiPath(msg.pagePath) || msg.pagePath;
+    // Prefer same-page cursors; if path missing/mismatch but both racing, still show
+    // so a canonicalize miss does not make cursors "vanish".
+    if (remotePath && myPath && !pathsEqual(remotePath, myPath)) {
+      // Keep a dimmed/off-page marker? Show anyway — QA said filter was too aggressive.
     }
     upsertCursor(msg.playerId, msg.playerName, msg.x, msg.y);
     return;
@@ -676,6 +723,8 @@ chrome.runtime.onMessage.addListener((msg) => {
     return;
   }
   if (msg.type === 'link_claimed' && msg.claim) {
+    raceCtx.racing = true;
+    try { sessionStorage.setItem('__wr_racing', '1'); } catch (_) {}
     const c = {
       ...msg.claim,
       sourcePath: canonicalWikiPath(msg.claim.sourcePath) || msg.claim.sourcePath,
@@ -686,12 +735,23 @@ chrome.runtime.onMessage.addListener((msg) => {
     );
     if (!exists) raceCtx.claims.push(c);
     else {
-      // update name/id
       raceCtx.claims = raceCtx.claims.map((x) =>
         pathsEqual(x.sourcePath, c.sourcePath) && pathsEqual(x.targetPath, c.targetPath) ? c : x
       );
     }
+    // Apply red/strikethrough immediately — do not wait for nav or popup
     refreshClaimsUi();
+    const here = currentArticlePath();
+    if (here && pathsEqual(here, c.sourcePath)) {
+      document
+        .querySelectorAll(
+          '#content a[href], #bodyContent a[href], #mw-content-text a[href], main a[href], .mw-parser-output a[href]'
+        )
+        .forEach((a) => {
+          const tp = articlePathFromUrl(a.href);
+          if (tp && pathsEqual(tp, c.targetPath)) flashClaimed(a);
+        });
+    }
     return;
   }
   if (msg.type === 'link_unclaimed') {
@@ -703,9 +763,13 @@ chrome.runtime.onMessage.addListener((msg) => {
           ? [{ sourcePath: msg.sourcePath, targetPath: msg.targetPath }]
           : [];
     if (list.length) {
-      const keys = new Set(list.map((c) => `${c.sourcePath}::${c.targetPath}`));
       raceCtx.claims = raceCtx.claims.filter(
-        (c) => !keys.has(`${c.sourcePath}::${c.targetPath}`)
+        (c) =>
+          !list.some(
+            (u) =>
+              pathsEqual(c.sourcePath, u.sourcePath) &&
+              pathsEqual(c.targetPath, u.targetPath)
+          )
       );
       refreshClaimsUi();
     }
@@ -725,8 +789,14 @@ chrome.runtime.onMessage.addListener((msg) => {
 
 syncRaceContext();
 
+let claimsMoTimer = null;
 const mo = new MutationObserver(() => {
-  if (raceCtx.racing) refreshClaimsUi();
+  if (!raceCtx.racing && sessionStorage.getItem('__wr_racing') !== '1') return;
+  if (claimsMoTimer) return;
+  claimsMoTimer = setTimeout(() => {
+    claimsMoTimer = null;
+    refreshClaimsUi();
+  }, 50);
 });
 mo.observe(document.documentElement, { childList: true, subtree: true });
 
@@ -951,3 +1021,6 @@ function maybeAnnounceTargetReached() {
   report('page_load', clicks);
 }
 
+
+})(); // wrMain
+}

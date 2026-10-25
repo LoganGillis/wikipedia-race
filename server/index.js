@@ -310,6 +310,44 @@ function joinLobby(ws, code, name) {
   broadcastLobby(lobby, 'lobby_update');
 }
 
+
+function resumeSession(ws, msg) {
+  const code = String(msg.code || '').trim().toUpperCase();
+  const playerId = String(msg.playerId || '').trim();
+  const lobby = lobbies.get(code);
+  if (!lobby || !playerId) {
+    send(ws, 'error', { message: 'Cannot resume — lobby not found' });
+    return;
+  }
+  const player = lobby.players.get(playerId);
+  if (!player) {
+    send(ws, 'error', { message: 'Cannot resume — player not in lobby' });
+    return;
+  }
+  // Detach any stale socket mapped to this player
+  if (player.ws && player.ws !== ws) {
+    try {
+      socketPlayers.delete(player.ws);
+    } catch (_) {}
+  }
+  // If this ws was mapped to someone else, clear that
+  const prev = socketPlayers.get(ws);
+  if (prev && prev !== playerId) {
+    const otherLobby = findLobbyByPlayer(prev);
+    const other = otherLobby?.players.get(prev);
+    if (other && other.ws === ws) {
+      other.ws = null;
+      other.connected = false;
+    }
+  }
+  player.ws = ws;
+  player.connected = true;
+  if (msg.name) player.name = sanitizeName(msg.name);
+  socketPlayers.set(ws, playerId);
+  send(ws, 'lobby_joined', { playerId, lobby: lobbySnapshot(lobby), resumed: true });
+  broadcastLobby(lobby, 'lobby_update');
+}
+
 function setMode(ws, mode) {
   const playerId = socketPlayers.get(ws);
   if (!playerId) return;
@@ -471,12 +509,7 @@ function updateProgress(ws, payload) {
   if ((titleHit || pathHit) && !player.finished) {
     player.finished = true;
     player.finishedAt = Date.now();
-  }
-
-  const allFinished =
-    lobby.players.size > 0 &&
-    [...lobby.players.values()].every((p) => p.finished || !p.connected);
-  if (allFinished && [...lobby.players.values()].some((p) => p.finished)) {
+    // First to target wins — end the race for everyone immediately
     lobby.status = 'finished';
   }
 
@@ -650,6 +683,9 @@ wss.on('connection', (ws) => {
           break;
         case 'join_lobby':
           joinLobby(ws, msg.code, msg.name);
+          break;
+        case 'resume_session':
+          resumeSession(ws, msg);
           break;
         case 'set_mode':
           setMode(ws, msg.mode);

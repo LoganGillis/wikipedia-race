@@ -132,10 +132,11 @@ async function classicRaceFlow() {
   console.log('unclaimed count:', (unclaimed.claims || []).length);
   if (!unclaimed.claims?.length) throw new Error('expected unclaimed claims array');
 
-  // Finish by landing on target (path match)
+  // Finish by landing on target (path match) — first wins ends race for all
   const finishWait = ws2.wait(
     (m) =>
       m.type === 'lobby_update' &&
+      m.lobby.status === 'finished' &&
       m.lobby.players.some((p) => p.id === created.playerId && p.finished)
   );
   ws.send(
@@ -149,10 +150,85 @@ async function classicRaceFlow() {
   const finished = await finishWait;
   const winner = finished.lobby.players.find((p) => p.id === created.playerId);
   if (!winner.finished || !winner.finishedAt) throw new Error('finish detection failed');
-  console.log('finish ok:', winner.name, winner.clicks, 'clicks');
+  if (finished.lobby.status !== 'finished') throw new Error('race should end for everyone');
+  console.log('finish ok (race ended):', winner.name, winner.clicks, 'clicks');
 
   ws.close();
   ws2.close();
+}
+
+async function resumeSessionFlow() {
+  const host = await connect();
+  await host.wait((m) => m.type === 'hello');
+  host.send(JSON.stringify({ type: 'create_lobby', name: 'ResumeHost', mode: 'classic' }));
+  const created = await host.wait((m) => m.type === 'lobby_created');
+  const code = created.lobby.code;
+  const playerId = created.playerId;
+
+  const guest = await connect();
+  await guest.wait((m) => m.type === 'hello');
+  guest.send(JSON.stringify({ type: 'join_lobby', code, name: 'ResumeGuest' }));
+  await guest.wait((m) => m.type === 'lobby_joined');
+  await host.wait((m) => m.type === 'lobby_update');
+
+  host.send(JSON.stringify({ type: 'start_race' }));
+  const started = await host.wait((m) => m.type === 'race_started' || m.type === 'error', 20000);
+  if (started.type === 'error') throw new Error(started.message);
+  await guest.wait((m) => m.type === 'race_started', 20000);
+
+  // Simulate SW death: drop host socket, reconnect, resume same playerId
+  host.close();
+  await new Promise((r) => setTimeout(r, 200));
+  const host2 = await connect();
+  await host2.wait((m) => m.type === 'hello');
+  host2.send(
+    JSON.stringify({
+      type: 'resume_session',
+      code,
+      playerId,
+      name: 'ResumeHost',
+    })
+  );
+  const resumed = await host2.wait(
+    (m) => m.type === 'lobby_joined' || m.type === 'error',
+    10000
+  );
+  if (resumed.type === 'error') throw new Error(resumed.message);
+  if (resumed.playerId !== playerId) throw new Error('resume playerId mismatch');
+  if (resumed.lobby.status !== 'racing') throw new Error('expected racing after resume');
+  console.log('resume ok:', playerId.slice(0, 8), 'still in', code);
+
+  // Cursor from resumed host should reach guest
+  const sourcePathClean =
+    '/wiki/' + String(started.lobby.startPage.title).replace(/ /g, '_');
+  const cursorWait = guest.wait((m) => m.type === 'cursor_update');
+  host2.send(
+    JSON.stringify({
+      type: 'cursor_update',
+      x: 111,
+      y: 222,
+      pagePath: sourcePathClean,
+    })
+  );
+  const cursor = await cursorWait;
+  if (cursor.playerId !== playerId) throw new Error('resumed cursor playerId wrong');
+  console.log('resumed cursor ok');
+
+  // Instant claim broadcast after resume
+  const claimWait = guest.wait((m) => m.type === 'link_claimed');
+  host2.send(
+    JSON.stringify({
+      type: 'link_claim',
+      sourcePath: sourcePathClean,
+      targetPath: '/wiki/Resume_Claim_Target',
+    })
+  );
+  const claimed = await claimWait;
+  if (claimed.claim.playerId !== playerId) throw new Error('resumed claim playerId wrong');
+  console.log('resumed claim ok');
+
+  host2.close();
+  guest.close();
 }
 
 async function pickModeFlow() {
@@ -262,6 +338,7 @@ async function main() {
 
   await classicRaceFlow();
   await pickModeFlow();
+  await resumeSessionFlow();
   console.log('\nSMOKE OK');
 }
 

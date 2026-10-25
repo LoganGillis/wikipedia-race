@@ -1,12 +1,14 @@
 'use strict';
 
 const DEFAULT_SERVER = 'ws://51.81.33.210:3849/ws';
+const CONTENT_SCRIPT_FILE = 'content/content.js';
 
 /** @type {WebSocket|null} */
 let socket = null;
 /** @type {ReturnType<typeof setTimeout>|null} */
 let reconnectTimer = null;
 let intentionalClose = false;
+let offscreenCreating = null;
 
 const defaultState = () => ({
   serverUrl: DEFAULT_SERVER,
@@ -40,24 +42,65 @@ function broadcastToExtension(msg) {
 }
 
 async function listWikiTabs() {
-  // Match-pattern query is flaky across Chrome builds; filter manually.
   const tabs = await chrome.tabs.query({});
   return tabs.filter(
     (t) => t.id != null && t.url && /https?:\/\/[^/]*wikipedia\.org\//i.test(t.url)
   );
 }
 
+async function ensureContentInjected(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: [CONTENT_SCRIPT_FILE],
+    });
+  } catch (_) {
+    /* already injected or restricted */
+  }
+}
+
+async function ensureAllWikiContentInjected() {
+  const tabs = await listWikiTabs();
+  await Promise.all(tabs.map((t) => ensureContentInjected(t.id)));
+  return tabs;
+}
+
 async function forwardToWikiTabs(msg) {
   try {
     const tabs = await listWikiTabs();
     await Promise.all(
-      tabs.map((tab) =>
-        chrome.tabs.sendMessage(tab.id, msg).catch(() => {
-          /* content script may not be injected yet */
-        })
-      )
+      tabs.map(async (tab) => {
+        try {
+          await chrome.tabs.sendMessage(tab.id, msg);
+        } catch (_) {
+          await ensureContentInjected(tab.id);
+          try {
+            await chrome.tabs.sendMessage(tab.id, msg);
+          } catch (__) {
+            /* give up on this tab */
+          }
+        }
+      })
     );
   } catch (_) {}
+}
+
+async function pushRaceFlagsToWikiTabs() {
+  const tabs = await ensureAllWikiContentInjected();
+  for (const tab of tabs) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => {
+          try {
+            sessionStorage.setItem('__wr_racing', '1');
+          } catch (_) {}
+        },
+      });
+    } catch (_) {}
+  }
+  const state = await loadState();
+  await forwardToWikiTabs({ type: 'state', state });
 }
 
 function toWsUrl(input) {
@@ -71,6 +114,60 @@ function toWsUrl(input) {
   return u;
 }
 
+async function ensureOffscreen() {
+  if (!chrome.offscreen) return;
+  try {
+    const contexts = await chrome.runtime.getContexts({
+      contextTypes: ['OFFSCREEN_DOCUMENT'],
+    });
+    if (contexts && contexts.length) return;
+  } catch (_) {
+    // getContexts may be unavailable; try create anyway
+  }
+  if (offscreenCreating) {
+    await offscreenCreating;
+    return;
+  }
+  offscreenCreating = (async () => {
+    try {
+      await chrome.offscreen.createDocument({
+        url: 'offscreen/offscreen.html',
+        reasons: ['WORKERS'],
+        justification:
+          'Keep the multiplayer WebSocket alive while the service worker would otherwise sleep during a Wikipedia race',
+      });
+    } catch (err) {
+      const msg = String(err?.message || err);
+      if (!/already exists|Only a single/i.test(msg)) {
+        console.warn('offscreen create failed', msg);
+      }
+    } finally {
+      offscreenCreating = null;
+    }
+  })();
+  await offscreenCreating;
+}
+
+async function maybeCloseOffscreen() {
+  if (!chrome.offscreen) return;
+  const state = await loadState();
+  if (state.lobby) return;
+  try {
+    await chrome.offscreen.closeDocument();
+  } catch (_) {}
+}
+
+async function tryResumeSession() {
+  const state = await loadState();
+  if (!state.lobby?.code || !state.playerId) return;
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  send('resume_session', {
+    code: state.lobby.code,
+    playerId: state.playerId,
+    name: state.playerName || '',
+  });
+}
+
 async function connect() {
   const state = await loadState();
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
@@ -79,6 +176,7 @@ async function connect() {
   intentionalClose = false;
   const url = toWsUrl(state.serverUrl);
   await saveState({ connectionStatus: 'connecting', lastError: null, serverUrl: url });
+  if (state.lobby) await ensureOffscreen();
 
   try {
     socket = new WebSocket(url);
@@ -90,6 +188,14 @@ async function connect() {
 
   socket.addEventListener('open', async () => {
     await saveState({ connectionStatus: 'connected', lastError: null });
+    await tryResumeSession();
+    const st = await loadState();
+    if (st.lobby?.status === 'racing') {
+      await pushRaceFlagsToWikiTabs();
+    } else if (st.lobby) {
+      await ensureAllWikiContentInjected();
+      await forwardToWikiTabs({ type: 'state', state: st });
+    }
   });
 
   socket.addEventListener('message', async (ev) => {
@@ -118,7 +224,7 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     connect();
-  }, 2500);
+  }, 800);
 }
 
 function send(type, payload = {}) {
@@ -138,22 +244,36 @@ async function handleServerMessage(msg) {
         lobby: msg.lobby,
         lastError: null,
       });
-      if (msg.lobby?.status === 'racing' && msg.lobby.startPage?.url) {
-        openRaceTab(msg.lobby.startPage.url);
+      await ensureOffscreen();
+      if (msg.lobby?.status === 'racing') {
+        await pushRaceFlagsToWikiTabs();
+        if (msg.lobby.startPage?.url && !msg.resumed) {
+          openRaceTab(msg.lobby.startPage.url);
+        }
+      } else {
+        await ensureAllWikiContentInjected();
       }
       break;
     case 'race_started':
       await saveState({ lobby: msg.lobby, lastError: null });
-      // openRaceTab seeds nav (0 clicks) then navigates to start page
+      await ensureOffscreen();
+      await pushRaceFlagsToWikiTabs();
       if (msg.lobby?.startPage?.url) {
         await openRaceTab(msg.lobby.startPage.url);
       }
       break;
     case 'lobby_update':
     case 'race_preparing':
-      if (msg.lobby) await saveState({ lobby: msg.lobby });
+      if (msg.lobby) {
+        await saveState({ lobby: msg.lobby });
+        if (msg.lobby.status === 'racing') {
+          await ensureOffscreen();
+          await ensureAllWikiContentInjected();
+        }
+      }
       break;
     case 'cursor_update':
+      await ensureAllWikiContentInjected();
       forwardToWikiTabs({
         type: 'remote_cursor',
         playerId: msg.playerId,
@@ -168,10 +288,12 @@ async function handleServerMessage(msg) {
       break;
     case 'link_claimed':
       await mergeClaim(msg.claim);
+      await ensureAllWikiContentInjected();
       forwardToWikiTabs({ type: 'link_claimed', claim: msg.claim });
       break;
     case 'link_unclaimed':
       await removeClaims(msg.claims || (msg.claim ? [msg.claim] : []), msg.sourcePath, msg.targetPath);
+      await ensureAllWikiContentInjected();
       forwardToWikiTabs({
         type: 'link_unclaimed',
         claims: msg.claims,
@@ -217,9 +339,8 @@ async function removeClaims(list, sourcePath, targetPath) {
   await saveState({ lobby: { ...state.lobby, claims } });
 }
 
-/** Clear click stack in open wiki tabs and mark next load as race seed (0 clicks). */
 async function seedRaceNavigationInWikiTabs() {
-  const tabs = await listWikiTabs();
+  const tabs = await ensureAllWikiContentInjected();
   for (const tab of tabs) {
     try {
       await chrome.scripting.executeScript({
@@ -235,9 +356,7 @@ async function seedRaceNavigationInWikiTabs() {
           } catch (_) {}
         },
       });
-    } catch (_) {
-      /* tab may not allow scripting yet */
-    }
+    } catch (_) {}
     chrome.tabs.sendMessage(tab.id, { type: 'claims_reset' }).catch(() => {});
   }
 }
@@ -250,6 +369,10 @@ async function openRaceTab(url) {
   } else {
     await chrome.tabs.create({ url, active: true });
   }
+  // After navigation settles, re-inject + push state
+  setTimeout(async () => {
+    await pushRaceFlagsToWikiTabs();
+  }, 1200);
 }
 
 function sanitizeName(name) {
@@ -259,10 +382,33 @@ function sanitizeName(name) {
     .slice(0, 24);
 }
 
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'wr-keepalive') return;
+  port.onMessage.addListener((msg) => {
+    if (msg?.type === 'ping') {
+      port.postMessage({ type: 'pong', t: Date.now() });
+      if (socket?.readyState === WebSocket.OPEN) send('ping');
+      else connect();
+    }
+  });
+  port.onDisconnect.addListener(() => {});
+});
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
-    if (msg.type === 'get_state') {
-      sendResponse({ state: await loadState() });
+    if (msg.type === 'keepalive' || msg.type === 'get_state') {
+      const state = await loadState();
+      if (state.lobby) await ensureOffscreen();
+      if (!(socket && socket.readyState === WebSocket.OPEN)) {
+        await connect();
+      } else if (msg.type === 'keepalive') {
+        send('ping');
+      }
+      if (msg.type === 'get_state') {
+        sendResponse({ state });
+      } else {
+        sendResponse({ ok: true, connectionStatus: (await loadState()).connectionStatus });
+      }
       return;
     }
     if (msg.type === 'set_server_url') {
@@ -271,6 +417,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       socket = null;
       intentionalClose = false;
       await saveState({ serverUrl: toWsUrl(msg.serverUrl), lobby: null, playerId: null });
+      await maybeCloseOffscreen();
       await connect();
       sendResponse({ ok: true });
       return;
@@ -289,6 +436,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse({ ok: false, error: 'Not connected' });
         return;
       }
+      await ensureOffscreen();
       send('create_lobby', { name, mode: msg.mode === 'pick' ? 'pick' : 'classic' });
       sendResponse({ ok: true });
       return;
@@ -301,6 +449,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse({ ok: false, error: 'Not connected' });
         return;
       }
+      await ensureOffscreen();
       send('join_lobby', { code: msg.code, name });
       sendResponse({ ok: true });
       return;
@@ -327,6 +476,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === 'leave_lobby') {
       send('leave_lobby');
       await saveState({ lobby: null, playerId: null });
+      await maybeCloseOffscreen();
       sendResponse({ ok: true });
       return;
     }
@@ -338,6 +488,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === 'cursor_update') {
       if (!(socket && socket.readyState === WebSocket.OPEN)) {
         await ensureConnected();
+        await tryResumeSession();
       }
       const ok = send('cursor_update', {
         x: msg.x,
@@ -350,6 +501,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === 'link_claim') {
       if (!(socket && socket.readyState === WebSocket.OPEN)) {
         await ensureConnected();
+        await tryResumeSession();
       }
       const ok = send('link_claim', {
         sourcePath: msg.sourcePath,
@@ -359,6 +511,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       return;
     }
     if (msg.type === 'link_unclaim') {
+      if (!(socket && socket.readyState === WebSocket.OPEN)) {
+        await ensureConnected();
+        await tryResumeSession();
+      }
       send('link_unclaim', {
         sourcePath: msg.sourcePath,
         targetPath: msg.targetPath,
@@ -378,9 +534,12 @@ async function ensureConnected() {
     return true;
   }
   await connect();
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < 25; i++) {
     await new Promise((r) => setTimeout(r, 100));
-    if (socket?.readyState === WebSocket.OPEN) return true;
+    if (socket?.readyState === WebSocket.OPEN) {
+      await tryResumeSession();
+      return true;
+    }
   }
   return false;
 }
@@ -391,7 +550,6 @@ async function onWikiNav(msg) {
   const me = state.lobby.players?.find((p) => p.id === state.playerId);
   let clicks = me?.clicks ?? 0;
 
-  // Prefer absolute clicksHint from content script (nav stack) to avoid drift
   if (typeof msg.clicksHint === 'number' && Number.isFinite(msg.clicksHint)) {
     clicks = Math.max(0, Math.floor(msg.clicksHint));
   } else if (msg.kind === 'link_click') {
@@ -399,12 +557,9 @@ async function onWikiNav(msg) {
   } else if (msg.kind === 'back') {
     clicks = Math.max(0, clicks - 1);
   } else if (msg.kind === 'forward_nav') {
-    // History forward may restore a higher stack clicksHint; without hint, +1
     clicks += 1;
   }
-  // page_load with hint applies absolute value (including race seed → 0)
 
-  // Optimistic local update so popup CLICKS matches roster without waiting on WS RTT
   if (state.lobby.players && state.playerId) {
     const players = state.lobby.players.map((p) =>
       p.id === state.playerId
@@ -431,13 +586,16 @@ chrome.storage.local.get(['serverUrl', 'playerName'], async (local) => {
   if (local.serverUrl) patch.serverUrl = local.serverUrl;
   if (local.playerName) patch.playerName = local.playerName;
   if (Object.keys(patch).length) await saveState(patch);
+  const state = await loadState();
+  if (state.lobby) await ensureOffscreen();
   connect();
 });
 
 chrome.alarms.create('keepAlive', { periodInMinutes: 0.5 });
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'keepAlive') {
-    if (socket?.readyState === WebSocket.OPEN) send('ping');
-    else connect();
-  }
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== 'keepAlive') return;
+  const state = await loadState();
+  if (state.lobby) await ensureOffscreen();
+  if (socket?.readyState === WebSocket.OPEN) send('ping');
+  else connect();
 });
