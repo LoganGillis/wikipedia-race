@@ -9,6 +9,8 @@ let socket = null;
 let reconnectTimer = null;
 let intentionalClose = false;
 let offscreenCreating = null;
+/** @type {number|null} */
+let lastRaceTabId = null;
 
 const defaultState = () => ({
   serverUrl: DEFAULT_SERVER,
@@ -361,14 +363,33 @@ async function seedRaceNavigationInWikiTabs() {
   }
 }
 
-async function openRaceTab(url) {
-  await seedRaceNavigationInWikiTabs();
-  const tabs = await listWikiTabs();
-  if (tabs[0]?.id) {
-    await chrome.tabs.update(tabs[0].id, { url, active: true });
-  } else {
-    await chrome.tabs.create({ url, active: true });
+async function preferRaceTab() {
+  if (lastRaceTabId != null) {
+    try {
+      const tab = await chrome.tabs.get(lastRaceTabId);
+      if (tab?.id != null && tab.url && /https?:\/\/[^/]*wikipedia\.org\//i.test(tab.url)) {
+        return tab;
+      }
+    } catch (_) {
+      lastRaceTabId = null;
+    }
   }
+  const tabs = await listWikiTabs();
+  return tabs[0] || null;
+}
+
+async function openRaceTab(url, { seed = true } = {}) {
+  if (seed) await seedRaceNavigationInWikiTabs();
+  const existing = await preferRaceTab();
+  let tabId;
+  if (existing?.id) {
+    await chrome.tabs.update(existing.id, { url, active: true });
+    tabId = existing.id;
+  } else {
+    const created = await chrome.tabs.create({ url, active: true });
+    tabId = created.id;
+  }
+  if (tabId != null) lastRaceTabId = tabId;
   // After navigation settles, re-inject + push state
   setTimeout(async () => {
     await pushRaceFlagsToWikiTabs();
@@ -520,6 +541,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         targetPath: msg.targetPath,
         claims: msg.claims,
       });
+      sendResponse({ ok: true });
+      return;
+    }
+    if (msg.type === 'navigate_race_tab') {
+      const url = String(msg.url || '').trim();
+      if (!url || !/^https?:\/\/[^/]*wikipedia\.org\//i.test(url)) {
+        sendResponse({ ok: false, error: 'invalid url' });
+        return;
+      }
+      // Inspect start/target: reuse race tab, do NOT re-seed nav stack mid-race
+      await openRaceTab(url, { seed: false });
       sendResponse({ ok: true });
       return;
     }

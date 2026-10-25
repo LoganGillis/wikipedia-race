@@ -380,6 +380,22 @@ els.btnUseTab.addEventListener('click', async () => {
   submitPick(tab.title?.replace(/ - Wikipedia$/i, '') || '', tab.url);
 });
 
+
+function navigateRaceTab(ev) {
+  const a = ev.currentTarget;
+  const url = a.getAttribute('href');
+  if (!url || url === '#') {
+    ev.preventDefault();
+    return;
+  }
+  ev.preventDefault();
+  chrome.runtime.sendMessage({ type: 'navigate_race_tab', url }, () => {
+    refresh();
+  });
+}
+els.startPage.addEventListener('click', navigateRaceTab);
+els.targetPage.addEventListener('click', navigateRaceTab);
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'state' && msg.state) render(msg.state);
 });

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Wikipedia Race",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Multiplayer Wikipedia racing \u2014 join a lobby, race from a random start page to a target.",
   "permissions": [
     "storage",

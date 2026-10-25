@@ -187,13 +187,19 @@ function resetNavForNewRace() {
 }
 
 function report(kind, clicks) {
-  chrome.runtime.sendMessage({
+  const msg = {
     type: 'wiki_nav',
     kind,
     clicksHint: clicks,
-    title: articleTitleFromLocation(),
-    url: location.href,
-  }).catch(() => {});
+  };
+  // Server finishes whenever currentUrl/title matches the target. Only
+  // in-article link clicks may carry location so inspect / typed URL /
+  // seed / Back loads cannot false-win.
+  if (kind === 'link_click') {
+    msg.title = articleTitleFromLocation();
+    msg.url = location.href;
+  }
+  chrome.runtime.sendMessage(msg).catch(() => {});
 }
 
 function releaseClaimsBeyondClicks(newClicks) {
@@ -319,6 +325,9 @@ function reconcileNavigation() {
 function onPageShow() {
   const { clicks, kind } = reconcileNavigation();
   report(kind, clicks);
+  if (kind === 'link_click') {
+    maybeAnnounceTargetReached();
+  }
   refreshClaimsUi();
   
 /* Keep MV3 service worker + WS alive while on Wikipedia during a lobby/race */
@@ -476,7 +485,6 @@ function applyState(state) {
   refreshClaimsUi();
   renderHud();
   renderVictory();
-  maybeAnnounceTargetReached();
 }
 
 function isClaimedByOther(sourcePath, targetPath) {
@@ -1014,11 +1022,11 @@ function maybeAnnounceTargetReached() {
   if (!path || !targetPath || !pathsEqual(path, targetPath)) return;
   const me = lobby.players?.find((p) => p.id === raceCtx.playerId);
   if (me?.finished) return;
-  // Force progress update with current title so server marks finish
+  // Force progress update with location so server marks finish (link_click only path)
   const stack = loadStack();
   const idx = loadIndex();
   const clicks = idx >= 0 && stack[idx] ? stack[idx].clicks : me?.clicks ?? 0;
-  report('page_load', clicks);
+  report('link_click', clicks);
 }
 
 
