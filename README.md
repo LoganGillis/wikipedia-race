@@ -41,7 +41,7 @@ Optional: `PORT=4000 npm start`
 1. Start the server (above).
 2. Open Chrome → `chrome://extensions`
 3. Enable **Developer mode** (top right).
-4. Click **Load unpacked** → select the `extension/` folder in this repo.
+4. Click **Load unpacked** → select the **`extension/`** folder inside the repo (the folder that contains `manifest.json`), **not** the repo root. Loading `wikipedia-race/` itself fails with “Manifest file is missing”.
 5. Pin **Wikipedia Race** from the puzzle-piece menu.
 6. Open the popup:
    - Confirm server URL (`ws://localhost:3847/ws`)

@@ -1,6 +1,6 @@
 'use strict';
 
-const DEFAULT_SERVER = 'ws://localhost:3847/ws';
+const DEFAULT_SERVER = 'ws://51.81.33.210:3847/ws';
 
 /** @type {WebSocket|null} */
 let socket = null;
