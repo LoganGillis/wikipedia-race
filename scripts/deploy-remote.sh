@@ -2,7 +2,7 @@
 set -euo pipefail
 APP_DIR="${HOME}/wikipedia-race"
 REPO="https://github.com/LoganGillis/wikipedia-race.git"
-PORT=3848
+PORT=3849
 
 if [ ! -d "$APP_DIR/.git" ]; then
   git clone "$REPO" "$APP_DIR"
